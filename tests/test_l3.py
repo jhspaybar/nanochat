@@ -52,6 +52,22 @@ def test_lzw_allocation_edge_n_emb_equals_vocab():
     assert alloc == [1, 1, 1, 1]
 
 
+def test_lzw_allocation_ngram_last_token():
+    """LZW allocates to the last token of frequent n-grams, not just frequent unigrams."""
+    # Token 0 appears rarely on its own, but token 1 is always preceded by token 0
+    # creating the frequent bigram (0, 1). LZW should give extra embeddings to token 1
+    # (the last token of the bigram) even though token 2 has higher unigram frequency.
+    sequences = [
+        [2, 2, 2, 2, 2, 2, 2, 2, 2, 2,   # token 2 very frequent as unigram
+         0, 1, 0, 1, 0, 1, 0, 1, 0, 1,    # bigram (0,1) repeated
+         0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+         0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+    ]
+    alloc = compute_lzw_allocation(sequences, vocab_size=4, n_emb=20, k_max=32)
+    # Token 1 should get more embeddings than token 3 (which never appears)
+    assert alloc[1] > alloc[3], f"Token 1 (last of frequent bigram 0,1) should get more than token 3 (unseen)"
+
+
 # ---- L3Layer Tests ----
 
 def _make_l3(n_embd=16, n_emb=32, d_up=64, vocab_size=8, tie_kv=True):

@@ -42,7 +42,7 @@ class GPTConfig:
     l3_after_layers: str = ""   # comma-separated layer indices (empty = disabled)
     l3_n_emb: int = 0           # total embeddings (0 = disabled)
     l3_d_up: int = 0            # up-projection dim (0 = auto: 4 * n_embd)
-    l3_k_max: int = 512         # max embeddings per token
+    l3_k_max: int = 32          # max embeddings per token
     l3_tie_kv: bool = True      # tie key and value weights
 
 
@@ -185,8 +185,11 @@ class GPT(nn.Module):
         # L3 layers (placed between decoder blocks)
         self.l3_layer_indices = set(int(x) for x in config.l3_after_layers.split(",") if x.strip()) if config.l3_after_layers else set()
         l3_d_up = config.l3_d_up if config.l3_d_up > 0 else 4 * config.n_embd
+        if config.l3_d_up == 0 and self.l3_layer_indices:
+            config.l3_d_up = l3_d_up  # resolve auto-default so config printout is clear
         self.l3_layers = nn.ModuleDict({
-            str(i): L3Layer(config.n_embd, config.l3_n_emb, l3_d_up, config.l3_tie_kv)
+            str(i): L3Layer(config.n_embd, config.l3_n_emb, l3_d_up, config.l3_tie_kv,
+                            vocab_size=config.vocab_size, k_max=config.l3_k_max)
             for i in self.l3_layer_indices
         }) if self.l3_layer_indices and config.l3_n_emb > 0 else nn.ModuleDict()
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
@@ -251,7 +254,7 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(l3_layer.k_weight, mean=0.0, std=1.0)
                 torch.nn.init.normal_(l3_layer.v_weight, mean=0.0, std=1.0)
             torch.nn.init.uniform_(l3_layer.w_up.weight, -s, s)
-            torch.nn.init.zeros_(l3_layer.w_mix.weight)  # L3 starts as no-op
+            torch.nn.init.zeros_(l3_layer.w_mix.weight)  # Zero init (consistent with c_proj pattern)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -495,6 +498,28 @@ class GPT(nn.Module):
         else:
             # inference: just return the logits directly
             return logits
+
+    @torch.no_grad()
+    def l3_diagnostics(self, idx):
+        """Compute L3 delta/residual ratios outside of torch.compile. Call separately for logging."""
+        if not self.l3_layers:
+            return {}
+        B, T = idx.size()
+        T0 = 0
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        x0 = x
+        ratios = {}
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], None)
+            if str(i) in self.l3_layers:
+                l3_delta = self.l3_layers[str(i)](x, idx)
+                ratios[i] = (l3_delta.norm() / (x.norm() + 1e-8)).item()
+                x = x + l3_delta
+        return ratios
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

@@ -55,7 +55,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--l3-after-layers", type=str, default="", help="comma-separated layer indices for L3 (empty = disabled)")
 parser.add_argument("--l3-n-emb", type=int, default=0, help="total L3 embeddings (0 = auto-derive from model size)")
 parser.add_argument("--l3-d-up", type=int, default=0, help="L3 up-projection dim (0 = 4*n_embd)")
-parser.add_argument("--l3-k-max", type=int, default=512, help="max embeddings per token for L3")
+parser.add_argument("--l3-k-max", type=int, default=32, help="max embeddings per token for L3")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -147,12 +147,9 @@ def build_model_meta(depth, l3_after_layers="", l3_n_emb=0):
         model_meta = GPT(config)
     return model_meta
 
-# L3 precomputation: compute LZW allocation from training data sample
+# L3 precomputation part 1: auto-derive n_emb (needed before model build)
 l3_n_emb = args.l3_n_emb
-l3_bounds = None
 if args.l3_after_layers:
-    from nanochat.l3 import compute_lzw_allocation, allocation_to_bounds
-    # Auto-derive n_emb if not specified: scale proportional to model size
     if l3_n_emb == 0:
         # Build a temporary model to get param count for auto-derivation
         tmp_model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=vocab_size)
@@ -160,16 +157,6 @@ if args.l3_after_layers:
         l3_n_emb = max(vocab_size, tmp_params // 1000)
         del tmp_model
         print0(f"Auto-derived L3 n_emb: {l3_n_emb:,}")
-    # Read a sample of training data for LZW allocation
-    sample_loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, 1, args.max_seq_len, split="train", device=device)
-    sample_sequences = []
-    for _ in range(100):  # 100 batches should be enough
-        x_sample, _ = next(sample_loader)
-        sample_sequences.append(x_sample[0].tolist())
-    del sample_loader
-    l3_alloc = compute_lzw_allocation(sample_sequences, vocab_size, l3_n_emb, args.l3_k_max)
-    l3_bounds = allocation_to_bounds(l3_alloc).to(device)
-    print0(f"L3 allocation: {l3_n_emb:,} total embeddings, k_max={args.l3_k_max}, avg={l3_n_emb/vocab_size:.1f}/token")
 
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=l3_n_emb) # 1) Build on meta device (only shapes/dtypes, no data)
@@ -178,12 +165,6 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
-
-# Set L3 bounds after model creation
-if l3_bounds is not None:
-    for l3_layer in model.l3_layers.values():
-        l3_layer.set_bounds(l3_bounds)
-    print0(f"L3 bounds set for {len(model.l3_layers)} layer(s)")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -385,6 +366,45 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
+# L3 precomputation part 2: LZW allocation over the full training token budget
+if args.l3_after_layers:
+    from nanochat.l3 import compute_lzw_allocation, allocation_to_bounds
+    t0_lzw = time.time()
+    # Stream training data as token sequences for LZW analysis
+    def _l3_token_sequences():
+        loader = tokenizing_distributed_data_loader_bos_bestfit(
+            tokenizer, args.device_batch_size, args.max_seq_len, split="train", device="cpu")
+        tokens_seen = 0
+        while tokens_seen < total_tokens:
+            x_batch, _ = next(loader)
+            for row in x_batch:
+                yield row.tolist()
+                tokens_seen += row.shape[0]
+                if tokens_seen >= total_tokens:
+                    return
+    l3_alloc = compute_lzw_allocation(_l3_token_sequences(), vocab_size, l3_n_emb, args.l3_k_max)
+    l3_bounds = allocation_to_bounds(l3_alloc).to(device)
+    for l3_layer in orig_model.l3_layers.values():
+        l3_layer.set_bounds(l3_bounds)
+    dt_lzw = time.time() - t0_lzw
+    # Print allocation summary with distribution histogram
+    alloc_t = torch.tensor(l3_alloc)
+    print0(f"L3 allocation: {l3_n_emb:,} embeddings, k_max={args.l3_k_max}, avg={l3_n_emb/vocab_size:.1f}/token "
+           f"({total_tokens:,} tokens scanned in {dt_lzw:.1f}s)")
+    buckets = [(1, 1), (2, 2), (3, 4), (5, 8), (9, 16), (17, 32), (33, 64), (65, 128), (129, 256), (257, 512)]
+    counts = []
+    for lo, hi in buckets:
+        if lo > args.l3_k_max:
+            break
+        counts.append(((lo, min(hi, args.l3_k_max)), int(((alloc_t >= lo) & (alloc_t <= min(hi, args.l3_k_max))).sum())))
+    max_count = max(c for _, c in counts) if counts else 1
+    bar_width = 30
+    print0("L3 embeddings per token distribution:")
+    for (lo, hi), count in counts:
+        label = f"d_t={lo}" if lo == hi else f"d_t={lo}-{hi}"
+        bar = "\u2588" * round(count / max_count * bar_width)
+        print0(f"  {label:>8s} \u2502 {bar:<{bar_width}s} {count:>6,} ({count/vocab_size*100:5.1f}%)")
+
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = round(args.warmup_ratio * num_iterations)
@@ -454,7 +474,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -471,7 +491,7 @@ while True:
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
-        })
+        }, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -586,7 +606,12 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
-        wandb_run.log(log_data)
+        # L3 delta/residual ratio diagnostics (run outside torch.compile)
+        if orig_model.l3_layers:
+            l3_ratios = orig_model.l3_diagnostics(x[:1])
+            for layer_idx, ratio in l3_ratios.items():
+                log_data[f"l3/delta_ratio_layer{layer_idx}"] = ratio
+        wandb_run.log(log_data, step=step)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
