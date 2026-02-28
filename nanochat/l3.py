@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nanochat.common import norm
+
 
 def compute_lzw_allocation(token_sequences, vocab_size, n_emb, k_max):
     """
@@ -117,11 +119,11 @@ class L3Layer(nn.Module):
     """
     L3 layer: per-token lookup table with attention-like aggregation.
 
-    Forward pass (gather+pad approach):
-    1. Look up bounds for each token, gather KV embeddings, pad to k_max
-    2. Compute scores = K @ x_norm, mask invalid positions, softmax
-    3. Aggregate: weighted sum of V embeddings
-    4. Up-project, RMSNorm, concat with x, mix-project
+    Forward pass:
+    1. Norm input (pre-norm, same as backbone)
+    2. Look up per-token K/V embeddings, pad to k_max, mask invalid
+    3. Compute scores, softmax, aggregate
+    4. Up-project, norm, concat with x, mix-project
     Returns the delta (added residually by caller).
     """
 
@@ -153,50 +155,8 @@ class L3Layer(nn.Module):
     def set_bounds(self, bounds):
         """Register the precomputed bounds tensor as a buffer."""
         self.bounds = bounds
-        # Precompute k_max from bounds
         alloc = bounds[1:] - bounds[:-1]
         self.k_max = int(alloc.max().item())
-
-    def _attend_chunk(self, x_norm_chunk, starts_chunk, lengths_chunk, k_max):
-        """Process a chunk of tokens through the L3 attention mechanism.
-
-        Args:
-            x_norm_chunk: [N, C] normalized hidden states for this chunk
-            starts_chunk: [N] start indices into kv_weight
-            lengths_chunk: [N] number of valid embeddings per token
-            k_max: max embeddings (for padding)
-        Returns:
-            agg: [N, C] aggregated embeddings
-        """
-        N, C = x_norm_chunk.shape
-        device = x_norm_chunk.device
-
-        # Build index tensor [N, k_max] with valid indices and padding
-        offsets = torch.arange(k_max, device=device).unsqueeze(0)  # [1, k_max]
-        indices = starts_chunk.unsqueeze(1) + offsets               # [N, k_max]
-        mask = offsets < lengths_chunk.unsqueeze(1)                  # [N, k_max]
-
-        # Clamp indices to valid range (masked positions will be zeroed out)
-        indices = indices.clamp(0, self.n_emb - 1)
-
-        # Gather weights
-        if self.tie_kv:
-            kv = self.kv_weight[indices]  # [N, k_max, C]
-            k_emb = kv
-            v_emb = kv
-        else:
-            k_emb = self.k_weight[indices]  # [N, k_max, C]
-            v_emb = self.v_weight[indices]  # [N, k_max, C]
-
-        # Attention scores: K @ x_norm
-        scores = torch.bmm(k_emb, x_norm_chunk.unsqueeze(2)).squeeze(2)  # [N, k_max]
-        scores = scores.masked_fill(~mask, float('-inf'))
-
-        # Softmax + aggregate
-        weights = F.softmax(scores, dim=-1)  # [N, k_max]
-        weights = weights.masked_fill(~mask, 0.0)
-        agg = torch.bmm(weights.unsqueeze(1), v_emb).squeeze(1)  # [N, C]
-        return agg
 
     def forward(self, x, token_ids):
         """
@@ -207,39 +167,49 @@ class L3Layer(nn.Module):
             delta: [B, T, n_embd] to be added residually by caller
         """
         B, T, C = x.shape
-
-        # 1. RMSNorm the input
-        x_norm = F.rms_norm(x, (C,))
-
-        # 2. Look up bounds for each token
-        flat_ids = token_ids.reshape(-1)  # [B*T]
-        starts = self.bounds[flat_ids]     # [B*T]
-        ends = self.bounds[flat_ids + 1]   # [B*T]
-        lengths = ends - starts            # [B*T]
-        k_max = self.k_max
-        x_norm_flat = x_norm.reshape(B * T, C)
-
-        # 3. Process in chunks to keep tensor sizes under INT_MAX for MPS compatibility
-        # Each chunk produces [chunk, k_max, n_embd] tensors; limit to ~1B elements
-        max_chunk = max(1, (2**30) // max(k_max * C, 1))
         N = B * T
 
-        if N <= max_chunk:
-            agg = self._attend_chunk(x_norm_flat, starts, lengths, k_max)
-        else:
-            chunks = []
-            for i in range(0, N, max_chunk):
-                j = min(i + max_chunk, N)
-                chunks.append(self._attend_chunk(
-                    x_norm_flat[i:j], starts[i:j], lengths[i:j], k_max))
-            agg = torch.cat(chunks, dim=0)
+        # Pre-norm (same as backbone)
+        q = norm(x).reshape(N, C)
 
-        agg = agg.view(B, T, C)
+        # Look up per-token embedding bounds
+        flat_ids = token_ids.reshape(-1)                    # [N]
+        starts = self.bounds[flat_ids]                      # [N]
+        lengths = self.bounds[flat_ids + 1] - starts        # [N]
+        k_max = self.k_max
 
-        # 4. Up-project, RMSNorm, concat with x, mix-project
-        up = self.w_up(agg)                    # [B, T, d_up]
-        up = F.rms_norm(up, (self.d_up,))      # normalize
-        cat = torch.cat([up, x], dim=-1)       # [B, T, d_up + n_embd]
-        delta = self.w_mix(cat)                # [B, T, n_embd]
+        # Padded attention over per-token embeddings
+        # Chunked for MPS compatibility (intermediate tensors must stay under INT_MAX)
+        max_chunk = max(1, (2**30) // max(k_max * C, 1))
+        agg_parts = []
+        for i in range(0, N, max_chunk):
+            j = min(i + max_chunk, N)
+
+            # Build padded index tensor and validity mask
+            offsets = torch.arange(k_max, device=x.device)             # [k_max]
+            idx = starts[i:j, None] + offsets[None, :]                 # [n, k_max]
+            valid = offsets[None, :] < lengths[i:j, None]              # [n, k_max]
+            idx = idx.clamp(0, self.n_emb - 1)
+
+            # Gather K/V embeddings
+            if self.tie_kv:
+                kv = self.kv_weight[idx]                               # [n, k_max, C]
+                scores = torch.bmm(kv, q[i:j, :, None]).squeeze(2)    # [n, k_max]
+                scores = scores.masked_fill(~valid, float('-inf'))
+                w = F.softmax(scores, dim=-1).masked_fill(~valid, 0.0)
+                agg_parts.append(torch.bmm(w[:, None, :], kv).squeeze(1))
+            else:
+                k = self.k_weight[idx]                                 # [n, k_max, C]
+                v = self.v_weight[idx]                                 # [n, k_max, C]
+                scores = torch.bmm(k, q[i:j, :, None]).squeeze(2)
+                scores = scores.masked_fill(~valid, float('-inf'))
+                w = F.softmax(scores, dim=-1).masked_fill(~valid, 0.0)
+                agg_parts.append(torch.bmm(w[:, None, :], v).squeeze(1))
+
+        agg = torch.cat(agg_parts, dim=0).view(B, T, C)
+
+        # Up-project, norm, concat with input, mix-project
+        up = norm(self.w_up(agg))
+        delta = self.w_mix(torch.cat([up, x], dim=-1))
 
         return delta

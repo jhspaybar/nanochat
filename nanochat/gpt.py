@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.common import get_dist_info, print0
+from nanochat.common import get_dist_info, print0, norm
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
@@ -44,11 +44,6 @@ class GPTConfig:
     l3_d_up: int = 0            # up-projection dim (0 = auto: 4 * n_embd)
     l3_k_max: int = 32          # max embeddings per token
     l3_tie_kv: bool = True      # tie key and value weights
-
-
-def norm(x):
-    # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
 
 
 def has_ve(layer_idx, n_layer):
@@ -192,6 +187,10 @@ class GPT(nn.Module):
                             vocab_size=config.vocab_size, k_max=config.l3_k_max)
             for i in self.l3_layer_indices
         }) if self.l3_layer_indices and config.l3_n_emb > 0 else nn.ModuleDict()
+        # L3 per-layer learnable scaling (like resid_lambdas for the residual stream)
+        sorted_l3 = sorted(self.l3_layer_indices) if self.l3_layer_indices else []
+        self._l3_lambda_map = {i: pos for pos, i in enumerate(sorted_l3)}
+        self.l3_lambdas = nn.Parameter(torch.ones(len(sorted_l3))) if sorted_l3 else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -255,6 +254,8 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(l3_layer.v_weight, mean=0.0, std=1.0)
             torch.nn.init.uniform_(l3_layer.w_up.weight, -s, s)
             torch.nn.init.zeros_(l3_layer.w_mix.weight)  # Zero init (consistent with c_proj pattern)
+        if self.l3_lambdas is not None:
+            self.l3_lambdas.fill_(1.0)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -353,13 +354,15 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        # L3 FLOPs: per layer, approx 2*avg_k*n_embd (attention) + 2*n_embd*d_up (up) + 2*(d_up+n_embd)*n_embd (mix)
+        # L3 FLOPs: only the attention-like compute (K_t@x and V_t@score).
+        # W_up and W_mix are already counted in 6*(nparams-nparams_exclude) above.
+        # Forward: 2*avg_k*n_embd (K@x) + 2*avg_k*n_embd (V@score) = 4*avg_k*n_embd
+        # Fwd+bwd: 3x forward = 12*avg_k*n_embd
         l3_flops = 0
         if self.l3_layers:
             n_embd = self.config.n_embd
-            l3_d_up = self.config.l3_d_up if self.config.l3_d_up > 0 else 4 * n_embd
             avg_k = self.config.l3_n_emb / self.config.vocab_size if self.config.vocab_size > 0 else 1
-            per_l3 = 2 * avg_k * n_embd + 2 * n_embd * l3_d_up + 2 * (l3_d_up + n_embd) * n_embd
+            per_l3 = 12 * avg_k * n_embd
             l3_flops = int(per_l3 * len(self.l3_layers))
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops + l3_flops
         return num_flops_per_token
@@ -381,7 +384,7 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + (self.l3_lambdas.numel() if self.l3_lambdas is not None else 0)
         # L3: separate embedding-like params from matrix params
         l3_embeds = 0
         l3_matrices = 0
@@ -415,9 +418,10 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        # L3 params: embedding-like (kv/k/v weights) and matrix (w_up, w_mix)
+        # L3 params: embedding-like (kv/k/v weights), matrix (w_up, w_mix), and scalars (l3_lambdas)
         l3_embed_params = []
         l3_matrix_params = []
+        l3_scalar_params = [self.l3_lambdas] if self.l3_lambdas is not None else []
         for l3_layer in self.l3_layers.values():
             if l3_layer.tie_kv:
                 l3_embed_params.append(l3_layer.kv_weight)
@@ -426,7 +430,7 @@ class GPT(nn.Module):
                 l3_embed_params.append(l3_layer.v_weight)
             l3_matrix_params.append(l3_layer.w_up.weight)
             l3_matrix_params.append(l3_layer.w_mix.weight)
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params) + len(l3_scalar_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -441,6 +445,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        # L3 scalar params (like x0_lambdas: learned gating)
+        if l3_scalar_params:
+            param_groups.append(dict(kind='adamw', params=l3_scalar_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
         # L3 param groups: embeddings use AdamW (like token embeddings), matrices use Muon
         if l3_embed_params:
             param_groups.append(dict(kind='adamw', params=l3_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
@@ -480,7 +487,7 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             # L3 layer after this block (if configured)
             if str(i) in self.l3_layers:
-                x = x + self.l3_layers[str(i)](x, idx)
+                x = x + self.l3_lambdas[self._l3_lambda_map[i]] * self.l3_layers[str(i)](x, idx)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -516,7 +523,7 @@ class GPT(nn.Module):
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], None)
             if str(i) in self.l3_layers:
-                l3_delta = self.l3_layers[str(i)](x, idx)
+                l3_delta = self.l3_lambdas[self._l3_lambda_map[i]] * self.l3_layers[str(i)](x, idx)
                 ratios[i] = (l3_delta.norm() / (x.norm() + 1e-8)).item()
                 x = x + l3_delta
         return ratios

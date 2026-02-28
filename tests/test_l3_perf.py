@@ -190,20 +190,11 @@ def test_l3_perf_component_breakdown():
     k_max = layer.k_max
 
     x_norm = F.rms_norm(x, (n_embd,))
-    starts = layer.bounds[flat_ids]
-    lengths = layer.bounds[flat_ids + 1] - starts
     x_flat = x_norm.reshape(-1, n_embd)
 
-    max_chunk = max(1, (2**30) // max(k_max * n_embd, 1))
-    num_chunks = (N + max_chunk - 1) // max_chunk
-
-    # Single chunk
-    chunk_n = min(N, max_chunk)
-    t = _time_fn(lambda: layer._attend_chunk(x_flat[:chunk_n], starts[:chunk_n],
-                                              lengths[:chunk_n], k_max), device=device)
-    print(f"\n  Attend chunk ({chunk_n} tokens, pad to {k_max}): {sum(t)/len(t)*1000:.1f}ms")
-    print(f"  Tensor size: [{chunk_n}, {k_max}, {n_embd}] = {chunk_n*k_max*n_embd/1e6:.0f}M elements")
-    print(f"  Chunks needed: {num_chunks}")
+    # Attention via per-k tiered approach (calls _attend which groups by k value)
+    t = _time_fn(lambda: layer._attend(x_flat, flat_ids, device), device=device)
+    print(f"\n  Attend tiered ({N} tokens, {len(layer._unique_k)} k-groups): {sum(t)/len(t)*1000:.1f}ms")
 
     # Dense
     agg = torch.randn(B, T, n_embd, device=device)

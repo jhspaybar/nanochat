@@ -53,9 +53,10 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # L3 (Large Lookup Layers)
 parser.add_argument("--l3-after-layers", type=str, default="", help="comma-separated layer indices for L3 (empty = disabled)")
-parser.add_argument("--l3-n-emb", type=int, default=0, help="total L3 embeddings (0 = auto-derive from model size)")
+parser.add_argument("--l3-n-emb", type=int, default=0, help="total L3 embeddings (0 = auto: 2x vocab_size)")
 parser.add_argument("--l3-d-up", type=int, default=0, help="L3 up-projection dim (0 = 4*n_embd)")
 parser.add_argument("--l3-k-max", type=int, default=32, help="max embeddings per token for L3")
+parser.add_argument("--l3-lzw-tokens", type=int, default=500_000_000, help="max tokens to scan for LZW allocation (default 500M)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -80,6 +81,7 @@ parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number o
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--log-every", type=int, default=100, help="log training metrics to wandb every N steps")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -151,12 +153,9 @@ def build_model_meta(depth, l3_after_layers="", l3_n_emb=0):
 l3_n_emb = args.l3_n_emb
 if args.l3_after_layers:
     if l3_n_emb == 0:
-        # Build a temporary model to get param count for auto-derivation
-        tmp_model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=vocab_size)
-        tmp_params = sum(p.numel() for p in tmp_model.parameters())
-        l3_n_emb = max(vocab_size, tmp_params // 1000)
-        del tmp_model
-        print0(f"Auto-derived L3 n_emb: {l3_n_emb:,}")
+        # Default: ~2x vocab size (paper uses 710K for 180K vocab ≈ 3.9x; 2x is conservative)
+        l3_n_emb = 2 * vocab_size
+        print0(f"Auto-derived L3 n_emb: {l3_n_emb:,} (2x vocab_size)")
 
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=l3_n_emb) # 1) Build on meta device (only shapes/dtypes, no data)
@@ -370,17 +369,18 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 if args.l3_after_layers:
     from nanochat.l3 import compute_lzw_allocation, allocation_to_bounds
     t0_lzw = time.time()
-    # Stream training data as token sequences for LZW analysis
+    # Stream training data as token sequences for LZW analysis (capped for speed)
+    lzw_token_cap = min(args.l3_lzw_tokens, total_tokens)
     def _l3_token_sequences():
         loader = tokenizing_distributed_data_loader_bos_bestfit(
             tokenizer, args.device_batch_size, args.max_seq_len, split="train", device="cpu")
         tokens_seen = 0
-        while tokens_seen < total_tokens:
+        while tokens_seen < lzw_token_cap:
             x_batch, _ = next(loader)
             for row in x_batch:
                 yield row.tolist()
                 tokens_seen += row.shape[0]
-                if tokens_seen >= total_tokens:
+                if tokens_seen >= lzw_token_cap:
                     return
     l3_alloc = compute_lzw_allocation(_l3_token_sequences(), vocab_size, l3_n_emb, args.l3_k_max)
     l3_bounds = allocation_to_bounds(l3_alloc).to(device)
@@ -390,7 +390,7 @@ if args.l3_after_layers:
     # Print allocation summary with distribution histogram
     alloc_t = torch.tensor(l3_alloc)
     print0(f"L3 allocation: {l3_n_emb:,} embeddings, k_max={args.l3_k_max}, avg={l3_n_emb/vocab_size:.1f}/token "
-           f"({total_tokens:,} tokens scanned in {dt_lzw:.1f}s)")
+           f"({lzw_token_cap:,} tokens scanned in {dt_lzw:.1f}s)")
     buckets = [(1, 1), (2, 2), (3, 4), (5, 8), (9, 16), (17, 32), (33, 64), (65, 128), (129, 256), (257, 512)]
     counts = []
     for lo, hi in buckets:
@@ -457,7 +457,8 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    tokens_so_far = total_batch_size * step
+    flops_so_far = num_flops_per_token * tokens_so_far
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -471,6 +472,7 @@ while True:
             min_val_bpb = val_bpb
         wandb_run.log({
             "step": step,
+            "total_training_tokens": tokens_so_far,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
@@ -488,6 +490,7 @@ while True:
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
+            "total_training_tokens": tokens_so_far,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
@@ -594,9 +597,10 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    if step % args.log_every == 0:
         log_data = {
             "step": step,
+            "total_training_tokens": tokens_so_far,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
