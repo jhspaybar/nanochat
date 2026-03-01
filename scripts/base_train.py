@@ -64,6 +64,8 @@ parser.add_argument("--tbptl", type=int, default=0, help="Truncated backprop: fo
 # MLP type
 parser.add_argument("--mlp", type=str, default="relu2", choices=["relu2", "swiglu", "convswiglu"],
                     help="MLP type: relu2 (default), swiglu (gated SiLU), or convswiglu (SwiGLU + depthwise conv)")
+# MPS acceleration
+parser.add_argument("--mps-flash", action="store_true", help="enable Metal Flash Attention on MPS (requires metal-flash-sdpa)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -103,6 +105,10 @@ user_config = vars(args).copy()  # for logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+if args.mps_flash and device_type == "mps":
+    from nanochat.flash_attention import enable_mps_flash
+    enable_mps_flash()
+    print("Metal Flash Attention enabled")
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
@@ -121,6 +127,8 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 # Flash Attention status
 if HAS_FA3:
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+elif args.mps_flash and device_type == "mps":
+    print0("✓ Using Metal Flash Attention on MPS")
 else:
     print0("!" * 80)
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")

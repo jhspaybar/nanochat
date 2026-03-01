@@ -13,8 +13,85 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import math
 import torch
 import torch.nn.functional as F
+
+
+# =============================================================================
+# Metal Flash Attention on MPS (registered as torch custom ops for torch.compile)
+# =============================================================================
+_mfa_forward = None
+_mfa_backward = None
+
+
+def enable_mps_flash():
+    """Enable Metal Flash Attention for MPS. Called from training script with --mps-flash."""
+    global _mfa_forward, _mfa_backward
+    try:
+        from metal_flash_sdpa._C import mfa_attention_forward, mfa_attention_backward
+        _mfa_forward = mfa_attention_forward
+        _mfa_backward = mfa_attention_backward
+    except ImportError:
+        raise ImportError("metal-flash-sdpa not installed. Install from: https://github.com/alliprice/metal-flash-sdpa")
+
+
+# Custom ops: torch.compile sees these as opaque nodes (no graph break).
+# The function bodies reference _mfa_forward/_mfa_backward globals which are
+# set by enable_mps_flash() before compilation. During tracing, torch.compile
+# uses the register_fake implementations for shape inference.
+
+@torch.library.custom_op("nanochat_mfa::forward", mutates_args=())
+def _mfa_fwd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                scale: float, is_causal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """MFA forward. q/k/v in (B, H, T, D), returns (output, lse)."""
+    qt = q.transpose(1, 2).contiguous()
+    kt = k.transpose(1, 2).contiguous()
+    vt = v.transpose(1, 2).contiguous()
+    o, lse = _mfa_forward(qt, kt, vt, scale, is_causal)
+    return o.transpose(1, 2).contiguous(), lse
+
+
+@_mfa_fwd_op.register_fake
+def _mfa_fwd_fake(q, k, v, scale, is_causal):
+    B, H, T, D = q.shape
+    return q.new_empty(q.shape), q.new_empty(B * H * T, dtype=torch.float32)
+
+
+@torch.library.custom_op("nanochat_mfa::backward", mutates_args=())
+def _mfa_bwd_op(grad_out: torch.Tensor, q: torch.Tensor, k: torch.Tensor,
+                v: torch.Tensor, out: torch.Tensor, lse: torch.Tensor,
+                scale: float, is_causal: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MFA backward. All spatial tensors in (B, H, T, D), lse is flat (B*H*T,)."""
+    gt = grad_out.transpose(1, 2).contiguous()
+    qt = q.transpose(1, 2).contiguous()
+    kt = k.transpose(1, 2).contiguous()
+    vt = v.transpose(1, 2).contiguous()
+    ot = out.transpose(1, 2).contiguous()
+    dq, dk, dv = _mfa_backward(qt, kt, vt, ot, lse, gt, scale, is_causal)
+    return dq.transpose(1, 2).contiguous(), dk.transpose(1, 2).contiguous(), dv.transpose(1, 2).contiguous()
+
+
+@_mfa_bwd_op.register_fake
+def _mfa_bwd_fake(grad_out, q, k, v, out, lse, scale, is_causal):
+    return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+
+
+def _mfa_setup_ctx(ctx, inputs, output):
+    q, k, v, scale, is_causal = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse)
+    ctx.scale = scale
+    ctx.is_causal = is_causal
+
+
+def _mfa_backward_fn(ctx, grad_out, _grad_lse):
+    q, k, v, out, lse = ctx.saved_tensors
+    dq, dk, dv = _mfa_bwd_op(grad_out, q, k, v, out, lse, ctx.scale, ctx.is_causal)
+    return dq, dk, dv, None, None
+
+
+_mfa_fwd_op.register_autograd(_mfa_backward_fn, setup_context=_mfa_setup_ctx)
 
 
 # =============================================================================
@@ -69,6 +146,11 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 
     # Full context, same length
     if (window < 0 or window >= Tq) and Tq == Tk:
+        # Use Metal Flash Attention on MPS when available (custom op — no graph break)
+        if _mfa_forward is not None and q.device.type == 'mps' and not enable_gqa and Tq >= 256:
+            scale = q.size(-1) ** -0.5
+            out, _lse = _mfa_fwd_op(q, k, v, scale, True)
+            return out
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
 
     # Single token generation
