@@ -57,6 +57,10 @@ parser.add_argument("--l3-n-emb", type=int, default=0, help="total L3 embeddings
 parser.add_argument("--l3-d-up", type=int, default=0, help="L3 up-projection dim (0 = 4*n_embd)")
 parser.add_argument("--l3-k-max", type=int, default=32, help="max embeddings per token for L3")
 parser.add_argument("--l3-lzw-tokens", type=int, default=500_000_000, help="max tokens to scan for LZW allocation (default 500M)")
+# Looped transformer
+parser.add_argument("--loops", type=int, default=1, help="Number of loops through shared blocks (1 = standard)")
+parser.add_argument("--l3-every-loops", type=int, default=0, help="Insert L3 every N loop boundaries (0 = disabled, requires --loops>1)")
+parser.add_argument("--tbptl", type=int, default=0, help="Truncated backprop: forward-only for first N loops (0 = disabled)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -86,6 +90,10 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+if args.loops > 1 and args.l3_after_layers:
+    parser.error("--l3-after-layers and --loops>1 are mutually exclusive")
+if args.tbptl >= args.loops:
+    parser.error("--tbptl must be less than --loops")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -129,7 +137,7 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth, l3_after_layers="", l3_n_emb=0):
+def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_loops=1, tbptl=0):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
@@ -144,21 +152,27 @@ def build_model_meta(depth, l3_after_layers="", l3_n_emb=0):
         l3_n_emb=l3_n_emb,
         l3_d_up=args.l3_d_up,
         l3_k_max=args.l3_k_max,
+        n_loops=n_loops,
+        l3_every_loops=l3_every_loops,
+        tbptl=tbptl,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
     return model_meta
 
 # L3 precomputation part 1: auto-derive n_emb (needed before model build)
+# Standard mode: auto-derive when --l3-after-layers is set
+# Looped mode: auto-derive when --l3-every-loops > 0
 l3_n_emb = args.l3_n_emb
-if args.l3_after_layers:
+if args.l3_after_layers or (args.loops > 1 and args.l3_every_loops > 0):
     if l3_n_emb == 0:
         # Default: ~2x vocab size (paper uses 710K for 180K vocab ≈ 3.9x; 2x is conservative)
         l3_n_emb = 2 * vocab_size
         print0(f"Auto-derived L3 n_emb: {l3_n_emb:,} (2x vocab_size)")
 
 # Build the model, move to device, init the weights
-model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=l3_n_emb) # 1) Build on meta device (only shapes/dtypes, no data)
+model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=l3_n_emb,
+                         n_loops=args.loops, l3_every_loops=args.l3_every_loops, tbptl=args.tbptl) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
@@ -366,7 +380,7 @@ print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # L3 precomputation part 2: LZW allocation over the full training token budget
-if args.l3_after_layers:
+if orig_model.l3_layers:
     from nanochat.l3 import compute_lzw_allocation, allocation_to_bounds
     t0_lzw = time.time()
     # Stream training data as token sequences for LZW analysis (capped for speed)

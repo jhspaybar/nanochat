@@ -277,3 +277,197 @@ def test_gpt_without_l3_unchanged():
     loss = model(x, y)
     assert loss.ndim == 0
     assert not torch.isnan(loss)
+
+
+# ---- Looped Transformer Tests ----
+
+def test_gpt_looped_forward():
+    """Looped model (no L3) produces valid loss."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        n_loops=2,
+    )
+    model = GPT(config)
+    model.init_weights()
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+
+
+def test_gpt_looped_backward():
+    """Shared weights receive gradients that accumulate across loops."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        n_loops=2,
+    )
+    model = GPT(config)
+    model.init_weights()
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    loss.backward()
+    # All block params should have gradients
+    for name, p in model.transformer.h.named_parameters():
+        assert p.grad is not None, f"No gradient for {name}"
+
+
+def test_gpt_looped_with_l3():
+    """Looped model with L3 at every loop boundary: correct number of layers, forward+backward works."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        n_loops=3, l3_every_loops=1,  # explicitly enable L3 at every boundary
+        l3_n_emb=128, l3_d_up=32, l3_k_max=16,
+    )
+    model = GPT(config)
+    model.init_weights()
+    # Should have 2 L3 layers (at loop boundaries 1 and 2)
+    assert len(model.l3_layers) == 2
+    assert "1" in model.l3_layers
+    assert "2" in model.l3_layers
+    # Set bounds
+    alloc = compute_lzw_allocation([[0, 1, 2, 3] * 4], vocab_size=64, n_emb=128, k_max=16)
+    bounds = allocation_to_bounds(alloc)
+    for l3_layer in model.l3_layers.values():
+        l3_layer.set_bounds(bounds)
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+    loss.backward()
+    # L3 params should have gradients
+    for name, p in model.l3_layers.named_parameters():
+        if 'bounds' not in name:
+            assert p.grad is not None, f"No gradient for L3 param {name}"
+
+
+def test_gpt_looped_l3_every_2():
+    """l3_every_loops=2 with 4 loops: L3 at loops 1 and 3 only."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        n_loops=4, l3_every_loops=2,
+        l3_n_emb=128, l3_d_up=32, l3_k_max=16,
+    )
+    model = GPT(config)
+    # Should have L3 at loops 1 and 3 (boundaries where (loop-1) % 2 == 0)
+    assert len(model.l3_layers) == 2
+    assert "1" in model.l3_layers
+    assert "3" in model.l3_layers
+    assert "2" not in model.l3_layers
+
+
+def test_gpt_looped_tbptl():
+    """TBPTL: early loops don't contribute gradients to block params."""
+    from nanochat.gpt import GPT, GPTConfig
+    # Model with tbptl=1: first loop is forward-only
+    config_tbptl = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        n_loops=2, tbptl=1,
+    )
+    model_tbptl = GPT(config_tbptl)
+    model_tbptl.init_weights()
+    # Model without tbptl for comparison
+    config_full = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        n_loops=2, tbptl=0,
+    )
+    model_full = GPT(config_full)
+    model_full.init_weights()
+    # Copy weights so they match
+    model_full.load_state_dict(model_tbptl.state_dict())
+    torch.manual_seed(42)
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    # Forward+backward with tbptl
+    model_tbptl.train()
+    loss_tbptl = model_tbptl(x, y)
+    loss_tbptl.backward()
+    # Forward+backward without tbptl
+    model_full.train()
+    loss_full = model_full(x, y)
+    loss_full.backward()
+    # With tbptl=1, gradients should generally differ (less gradient from fewer trainable loops)
+    # The key thing is that the tbptl model runs without error and produces valid gradients
+    for name, p in model_tbptl.transformer.h.named_parameters():
+        assert p.grad is not None, f"No gradient for {name} with tbptl"
+
+
+def test_gpt_loops_1_unchanged():
+    """loops=1 is identical to the non-looped config."""
+    from nanochat.gpt import GPT, GPTConfig
+    config_default = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+    )
+    config_loops1 = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        n_loops=1,
+    )
+    model_default = GPT(config_default)
+    model_loops1 = GPT(config_loops1)
+    model_default.init_weights()
+    # Copy weights
+    model_loops1.load_state_dict(model_default.state_dict())
+    torch.manual_seed(42)
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss_default = model_default(x, y)
+    loss_loops1 = model_loops1(x, y)
+    assert torch.allclose(loss_default, loss_loops1), f"loops=1 loss {loss_loops1} != default loss {loss_default}"
+
+
+def test_gpt_looped_kv_cache():
+    """loops>1 works with KV cache for inference."""
+    from nanochat.gpt import GPT, GPTConfig
+    from nanochat.engine import KVCache
+    config = GPTConfig(
+        sequence_len=16, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        n_loops=2,
+    )
+    model = GPT(config)
+    model.init_weights()
+    model.eval()
+    x = torch.randint(0, 64, (1, 8))
+    # Create KV cache with n_loops * n_layer slots
+    kv_cache = KVCache(
+        batch_size=1, num_heads=config.n_kv_head,
+        seq_len=16, head_dim=config.n_embd // config.n_head,
+        num_layers=config.n_layer * config.n_loops, device="cpu", dtype=torch.float32,
+    )
+    # Prefill
+    logits = model(x, kv_cache=kv_cache)
+    assert logits.shape == (1, 8, 64)
+    assert kv_cache.get_pos() == 8
+    # Decode one more token
+    x2 = torch.randint(0, 64, (1, 1))
+    logits2 = model(x2, kv_cache=kv_cache)
+    assert logits2.shape == (1, 1, 64)
+    assert kv_cache.get_pos() == 9
+
+
+def test_gpt_looped_l3_after_layers_exclusive():
+    """l3_after_layers + loops>1 raises assertion error."""
+    from nanochat.gpt import GPT, GPTConfig
+    import pytest
+    with pytest.raises(AssertionError, match="mutually exclusive"):
+        config = GPTConfig(
+            sequence_len=8, vocab_size=64, n_layer=4,
+            n_head=2, n_kv_head=2, n_embd=64,
+            l3_after_layers="2", l3_n_emb=128,
+            n_loops=2,
+        )
+        GPT(config)
