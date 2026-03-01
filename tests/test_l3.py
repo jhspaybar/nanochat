@@ -471,3 +471,161 @@ def test_gpt_looped_l3_after_layers_exclusive():
             n_loops=2,
         )
         GPT(config)
+
+
+# ---- ConvSwiGLU MLP Tests ----
+
+def test_gpt_convswiglu_forward():
+    """ConvSwiGLU model produces valid loss."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        mlp_type="convswiglu",
+    )
+    model = GPT(config)
+    model.init_weights()
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+
+
+def test_gpt_convswiglu_backward():
+    """Gradients flow to all ConvSwiGLU params including conv weight and bias."""
+    from nanochat.gpt import GPT, GPTConfig, ConvSwiGLU
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        mlp_type="convswiglu",
+    )
+    model = GPT(config)
+    model.init_weights()
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    # First pass + optimizer step to break through zero-init c_proj
+    loss = model(x, y)
+    loss.backward()
+    optimizer = model.setup_optimizer()
+    optimizer.step()
+    model.zero_grad(set_to_none=True)
+    # Second pass: now gradients should flow to all params
+    loss = model(x, y)
+    loss.backward()
+    # Check all params have gradients
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"No gradient for {name}"
+    # Specifically check conv weight and bias
+    for block in model.transformer.h:
+        assert isinstance(block.mlp, ConvSwiGLU)
+        assert block.mlp.dwconv.weight.grad is not None
+        assert block.mlp.dwconv.bias.grad is not None
+        assert block.mlp.dwconv.weight.grad.abs().sum() > 0
+        assert block.mlp.dwconv.bias.grad.abs().sum() > 0
+
+
+def test_gpt_convswiglu_optimizer():
+    """All ConvSwiGLU params in optimizer, conv bias routed to AdamW."""
+    from nanochat.gpt import GPT, GPTConfig, ConvSwiGLU
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        mlp_type="convswiglu",
+    )
+    model = GPT(config)
+    model.init_weights()
+    optimizer = model.setup_optimizer()
+    # Collect all optimizer param ids and their group kinds
+    opt_param_ids = set()
+    adamw_param_ids = set()
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            opt_param_ids.add(id(p))
+            if group["kind"] == "adamw":
+                adamw_param_ids.add(id(p))
+    # All model params should be in optimizer
+    for name, p in model.named_parameters():
+        assert id(p) in opt_param_ids, f"Parameter {name} not in optimizer"
+    # Conv biases should be in AdamW groups
+    for block in model.transformer.h:
+        assert id(block.mlp.dwconv.bias) in adamw_param_ids, "Conv bias should be in AdamW group"
+
+
+def test_gpt_convswiglu_with_loops():
+    """ConvSwiGLU + loops=2 forward+backward works."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        mlp_type="convswiglu",
+        n_loops=2,
+    )
+    model = GPT(config)
+    model.init_weights()
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+    loss.backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"No gradient for {name}"
+
+
+# ---- SwiGLU MLP Tests ----
+
+def test_gpt_swiglu_forward():
+    """SwiGLU model produces valid loss."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        mlp_type="swiglu",
+    )
+    model = GPT(config)
+    model.init_weights()
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+
+
+def test_gpt_swiglu_backward():
+    """Gradients flow to all SwiGLU params."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        mlp_type="swiglu",
+    )
+    model = GPT(config)
+    model.init_weights()
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    loss.backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"No gradient for {name}"
+
+
+def test_gpt_swiglu_with_loops():
+    """SwiGLU + loops=2 forward+backward works."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        mlp_type="swiglu",
+        n_loops=2,
+    )
+    model = GPT(config)
+    model.init_weights()
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+    loss.backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"No gradient for {name}"

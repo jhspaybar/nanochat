@@ -48,6 +48,7 @@ class GPTConfig:
     n_loops: int = 1            # times to loop through blocks (1 = standard)
     l3_every_loops: int = 0     # insert L3 every N loop boundaries (0 = disabled, only when n_loops > 1)
     tbptl: int = 0              # truncated backprop: forward-only for first N loops (0 = disabled)
+    mlp_type: str = "relu2"     # "relu2" (current) or "convswiglu"
 
 
 def has_ve(layer_idx, n_layer):
@@ -137,11 +138,52 @@ class MLP(nn.Module):
         return x
 
 
+class SwiGLU(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # 2/3 of 4x expansion for gate+up (roughly same param budget as relu2 MLP)
+        inter = (4 * config.n_embd * 2 // 3 + 255) // 256 * 256  # round to 256 for tensor cores
+        self.inter = inter
+        self.c_gate_up = nn.Linear(config.n_embd, inter * 2, bias=False)  # fused gate + up
+        self.c_proj = nn.Linear(inter, config.n_embd, bias=False)
+
+    def forward(self, x):
+        gate, up = self.c_gate_up(x).chunk(2, dim=-1)
+        x = F.silu(gate) * up
+        x = self.c_proj(x)
+        return x
+
+
+class ConvSwiGLU(nn.Module):
+    def __init__(self, config, conv_kernel=2):
+        super().__init__()
+        # SwiGLU uses 2/3 of 4x expansion for gate+up (roughly same param budget as relu2 MLP)
+        inter = (4 * config.n_embd * 2 // 3 + 255) // 256 * 256  # round to 256 for tensor cores
+        self.inter = inter
+        self.c_gate_up = nn.Linear(config.n_embd, inter * 2, bias=False)  # fused gate + up
+        self.dwconv = nn.Conv1d(inter, inter, kernel_size=conv_kernel,
+                                padding=conv_kernel // 2, groups=inter, bias=True)
+        self.c_proj = nn.Linear(inter, config.n_embd, bias=False)
+
+    def forward(self, x):
+        gate, up = self.c_gate_up(x).chunk(2, dim=-1)
+        x = F.silu(gate) * up
+        x = self.dwconv(x.transpose(1, 2).to(self.dwconv.weight.dtype))
+        x = x[..., :gate.size(1)]  # trim conv padding
+        x = F.silu(x)
+        x = x.transpose(1, 2).contiguous()
+        x = self.c_proj(x)
+        return x
+
+
+_MLP_TYPES = {"relu2": MLP, "swiglu": SwiGLU, "convswiglu": ConvSwiGLU}
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = _MLP_TYPES[config.mlp_type](config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -250,8 +292,17 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if isinstance(block.mlp, ConvSwiGLU):
+                torch.nn.init.uniform_(block.mlp.c_gate_up.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+                torch.nn.init.zeros_(block.mlp.dwconv.bias)
+                # dwconv.weight: leave at default init (Kaiming uniform, fine for small depthwise kernel)
+            elif isinstance(block.mlp, SwiGLU):
+                torch.nn.init.uniform_(block.mlp.c_gate_up.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -442,7 +493,10 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Split block params by dimensionality: 2D matrices go to Muon, everything else (1D biases,
+        # 3D conv weights) goes to AdamW. Muon is designed for 2D weight matrices only.
+        matrix_params = [p for p in self.transformer.h.parameters() if p.dim() == 2]
+        block_scalar_params = [p for p in self.transformer.h.parameters() if p.dim() != 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -460,7 +514,7 @@ class GPT(nn.Module):
                 l3_embed_params.append(l3_layer.v_weight)
             l3_matrix_params.append(l3_layer.w_up.weight)
             l3_matrix_params.append(l3_layer.w_mix.weight)
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params) + len(l3_scalar_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(block_scalar_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params) + len(l3_scalar_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -475,6 +529,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        # Block bias params (e.g. ConvSwiGLU depthwise conv bias) - empty when mlp_type="relu2"
+        if block_scalar_params:
+            param_groups.append(dict(kind='adamw', params=block_scalar_params, lr=scalar_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # L3 scalar params (like x0_lambdas: learned gating)
         if l3_scalar_params:
             param_groups.append(dict(kind='adamw', params=l3_scalar_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))

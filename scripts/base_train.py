@@ -61,6 +61,9 @@ parser.add_argument("--l3-lzw-tokens", type=int, default=500_000_000, help="max 
 parser.add_argument("--loops", type=int, default=1, help="Number of loops through shared blocks (1 = standard)")
 parser.add_argument("--l3-every-loops", type=int, default=0, help="Insert L3 every N loop boundaries (0 = disabled, requires --loops>1)")
 parser.add_argument("--tbptl", type=int, default=0, help="Truncated backprop: forward-only for first N loops (0 = disabled)")
+# MLP type
+parser.add_argument("--mlp", type=str, default="relu2", choices=["relu2", "swiglu", "convswiglu"],
+                    help="MLP type: relu2 (default), swiglu (gated SiLU), or convswiglu (SwiGLU + depthwise conv)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,7 +140,7 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_loops=1, tbptl=0):
+def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_loops=1, tbptl=0, mlp_type="relu2"):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
@@ -155,6 +158,7 @@ def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_
         n_loops=n_loops,
         l3_every_loops=l3_every_loops,
         tbptl=tbptl,
+        mlp_type=mlp_type,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -172,7 +176,8 @@ if args.l3_after_layers or (args.loops > 1 and args.l3_every_loops > 0):
 
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=l3_n_emb,
-                         n_loops=args.loops, l3_every_loops=args.l3_every_loops, tbptl=args.tbptl) # 1) Build on meta device (only shapes/dtypes, no data)
+                         n_loops=args.loops, l3_every_loops=args.l3_every_loops, tbptl=args.tbptl,
+                         mlp_type=args.mlp) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
