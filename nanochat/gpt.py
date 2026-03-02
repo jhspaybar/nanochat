@@ -43,7 +43,7 @@ class GPTConfig:
     l3_n_emb: int = 0           # total embeddings (0 = disabled)
     l3_d_up: int = 0            # up-projection dim (0 = auto: 4 * n_embd)
     l3_k_max: int = 32          # max embeddings per token
-    l3_lambda: bool = True      # learnable per-L3-layer scaling (False = unscaled residual)
+    l3_lambda: bool = False     # learnable per-L3-layer scaling (True = learnable, False = unscaled residual)
     # Looped transformer config
     n_loops: int = 1            # times to loop through blocks (1 = standard)
     l3_every_loops: int = 0     # insert L3 every N loop boundaries (0 = disabled, only when n_loops > 1)
@@ -526,7 +526,7 @@ class GPT(nn.Module):
         # L3 scalar params (like x0_lambdas: learned gating)
         if l3_scalar_params:
             param_groups.append(dict(kind='adamw', params=l3_scalar_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
-        # L3 param groups: embeddings use AdamW (like token embeddings), matrices use Muon
+        # L3 param groups: kv_weight uses AdamW (like token embeddings, no weight decay)
         if l3_embed_params:
             param_groups.append(dict(kind='adamw', params=l3_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
@@ -616,7 +616,7 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def l3_diagnostics(self, idx):
-        """Compute L3 delta/residual ratios outside of torch.compile. Call separately for logging."""
+        """Compute L3 diagnostic metrics outside of torch.compile. Returns flat dict with l3/ prefix keys."""
         if not self.l3_layers:
             return {}
         B, T = idx.size()
@@ -625,15 +625,19 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
-        ratios = {}
+        metrics = {}
         if self.config.n_loops > 1:
             # Looped mode: L3 at loop boundaries
             for loop in range(self.config.n_loops):
                 l3_key = str(loop)
                 if loop > 0 and l3_key in self.l3_layers:
-                    l3_delta = self._l3_scale(loop) * self.l3_layers[l3_key](x, idx)
-                    ratios[f"loop{loop}"] = (l3_delta.norm() / (x.norm() + 1e-8)).item()
-                    x = x + l3_delta
+                    delta, diag = self.l3_layers[l3_key].diagnostics(x, idx)
+                    scaled_delta = self._l3_scale(loop) * delta
+                    key = f"loop{loop}"
+                    metrics[f"l3/delta_ratio_{key}"] = (scaled_delta.norm() / (x.norm() + 1e-8)).item()
+                    for dname, dval in diag.items():
+                        metrics[f"l3/{dname}_{key}"] = dval
+                    x = x + scaled_delta
                 for i, block in enumerate(self.transformer.h):
                     x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                     ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
@@ -645,10 +649,22 @@ class GPT(nn.Module):
                 ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
                 x = block(x, ve, cos_sin, self.window_sizes[i], None)
                 if str(i) in self.l3_layers:
-                    l3_delta = self._l3_scale(i) * self.l3_layers[str(i)](x, idx)
-                    ratios[i] = (l3_delta.norm() / (x.norm() + 1e-8)).item()
-                    x = x + l3_delta
-        return ratios
+                    delta, diag = self.l3_layers[str(i)].diagnostics(x, idx)
+                    scaled_delta = self._l3_scale(i) * delta
+                    key = f"layer{i}"
+                    metrics[f"l3/delta_ratio_{key}"] = (scaled_delta.norm() / (x.norm() + 1e-8)).item()
+                    for dname, dval in diag.items():
+                        metrics[f"l3/{dname}_{key}"] = dval
+                    x = x + scaled_delta
+        # Weight norms (w_up, w_mix only — kv_weight is F.normalized at forward time so raw norm is meaningless)
+        for key, l3_layer in self.l3_layers.items():
+            metrics[f"l3/w_up_norm_{key}"] = l3_layer.w_up.weight.norm().item()
+            metrics[f"l3/w_mix_norm_{key}"] = l3_layer.w_mix.weight.norm().item()
+        # Lambda values
+        if self.l3_lambdas is not None:
+            for key, pos in self._l3_lambda_map.items():
+                metrics[f"l3/lambda_{key}"] = self.l3_lambdas[pos].item()
+        return metrics
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

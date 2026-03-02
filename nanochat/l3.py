@@ -19,6 +19,8 @@ within blocks, and masking handles per-token selection. Much more memory-
 efficient than per-token padding for large k_max.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -151,6 +153,7 @@ class L3Layer(nn.Module):
 
         # Single weight table for both keys and values (tied KV)
         self.kv_weight = nn.Parameter(torch.empty(n_emb, n_embd))
+        self.attn_scale = 1.0 / math.sqrt(n_embd)
 
         # Up-project from n_embd to d_up
         self.w_up = nn.Linear(n_embd, d_up, bias=False)
@@ -223,9 +226,12 @@ class L3Layer(nn.Module):
         starts = unique_offsets[inverse]       # [N]
         ends = unique_offsets[inverse + 1]     # [N]
 
-        # Gather KV embeddings for all relevant tokens
+        # Gather KV embeddings (RMSNorm'd like backbone QK-norm: q,k = norm(q), norm(k))
+        # Q is already norm(x); here we norm K to match. Values use un-normed embeddings.
         emb_ids = self.emb_alloc[keep_cols]    # [total_embs] — token ID per embedding
-        KV = self.kv_weight[keep_cols]         # [total_embs, C]
+        raw_KV = self.kv_weight[keep_cols]     # [total_embs, C]
+        K = norm(raw_KV)                        # [total_embs, C] — normed keys for scoring
+        V = raw_KV                              # [total_embs, C] — un-normed values for aggregation
 
         # Block-diagonal attention: iterate over blocks of bb sorted tokens.
         # Within each block, each token attends only to its own embeddings (via masking).
@@ -240,14 +246,15 @@ class L3Layer(nn.Module):
             emb_s = int(starts[block_start].item())
             emb_e = int(ends[block_end - 1].item())
             b_emb_ids = emb_ids[emb_s:emb_e]                  # [n_embs]
-            bKV = KV[emb_s:emb_e]                              # [n_embs, C]
+            bK = K[emb_s:emb_e]                                # [n_embs, C]
+            bV = V[emb_s:emb_e]                                # [n_embs, C]
 
-            # Masked attention: score, mask, softmax, aggregate
-            score = block_q @ bKV.T                            # [bs, n_embs]
+            # Masked attention: score with normed K, aggregate with un-normed V
+            score = (block_q @ bK.T) * self.attn_scale         # [bs, n_embs]
             mask = block_ids.unsqueeze(1) == b_emb_ids.unsqueeze(0)  # [bs, n_embs]
             score = score.masked_fill(~mask, float('-inf'))
             w = F.softmax(score, dim=-1).masked_fill(~mask, 0.0)
-            out_parts.append(w @ bKV)                          # [bs, C]
+            out_parts.append(w @ bV)                           # [bs, C]
 
         out = torch.cat(out_parts, dim=0)  # [N, C]
 
@@ -258,3 +265,88 @@ class L3Layer(nn.Module):
         up = norm(self.w_up(agg))
         delta = self.w_mix(torch.cat([up, x], dim=-1))
         return delta
+
+    @torch._dynamo.disable
+    @torch.no_grad()
+    def diagnostics(self, x, token_ids):
+        """Like forward(), but also returns mean attention entropy."""
+        B, T, C = x.shape
+        N = B * T
+        bb = self.bb
+
+        q = norm(x).reshape(N, C)
+        flat_ids = token_ids.reshape(-1)
+
+        seq_sort, fw = torch.sort(flat_ids, stable=True)
+        bw = torch.empty_like(fw)
+        bw[fw] = torch.arange(N, device=x.device)
+        q_sorted = q[fw]
+
+        unique, inverse, counts = torch.unique_consecutive(
+            seq_sort, return_inverse=True, return_counts=True
+        )
+        unique_emb_starts = self.bounds[unique]
+        unique_emb_ends = self.bounds[unique + 1]
+        unique_emb_lengths = unique_emb_ends - unique_emb_starts
+
+        unique_offsets = torch.zeros(len(unique) + 1, dtype=torch.long, device=x.device)
+        unique_offsets[1:] = torch.cumsum(unique_emb_lengths, dim=0)
+        total_embs = int(unique_offsets[-1].item())
+
+        flat_pos = torch.arange(total_embs, device=x.device)
+        base_off = torch.repeat_interleave(unique_offsets[:-1], unique_emb_lengths)
+        local_pos = flat_pos - base_off
+        base_starts = torch.repeat_interleave(unique_emb_starts, unique_emb_lengths)
+        keep_cols = base_starts + local_pos
+
+        starts = unique_offsets[inverse]
+        ends = unique_offsets[inverse + 1]
+
+        emb_ids = self.emb_alloc[keep_cols]
+        raw_KV = self.kv_weight[keep_cols]
+        K = norm(raw_KV)
+        V = raw_KV
+
+        # Per-token embedding counts (in sorted order) for splitting entropy
+        sorted_emb_counts = self.bounds[seq_sort + 1] - self.bounds[seq_sort]  # [N]
+
+        out_parts = []
+        all_entropies = []
+        for block_start in range(0, N, bb):
+            block_end = min(block_start + bb, N)
+            block_q = q_sorted[block_start:block_end]
+            block_ids = seq_sort[block_start:block_end]
+
+            emb_s = int(starts[block_start].item())
+            emb_e = int(ends[block_end - 1].item())
+            b_emb_ids = emb_ids[emb_s:emb_e]
+            bK = K[emb_s:emb_e]
+            bV = V[emb_s:emb_e]
+
+            score = (block_q @ bK.T) * self.attn_scale
+            mask = block_ids.unsqueeze(1) == b_emb_ids.unsqueeze(0)
+            score = score.masked_fill(~mask, float('-inf'))
+            w = F.softmax(score, dim=-1).masked_fill(~mask, 0.0)
+
+            # Entropy: -sum(w * log(w)) over valid positions per token
+            log_w = w.clamp(min=1e-10).log()
+            entropy = -(w * log_w).sum(dim=-1)  # [bs]
+            all_entropies.append(entropy)
+            out_parts.append(w @ bV)
+
+        out = torch.cat(out_parts, dim=0)
+        agg = out[bw].view(B, T, C)
+        up = norm(self.w_up(agg))
+        delta = self.w_mix(torch.cat([up, x], dim=-1))
+
+        all_entropies = torch.cat(all_entropies)  # [N], sorted order
+        mean_entropy = all_entropies.mean().item()
+
+        # High-k entropy: only tokens with 5+ embeddings
+        high_k_mask = sorted_emb_counts >= 5
+        if high_k_mask.any():
+            high_k_entropy = all_entropies[high_k_mask].mean().item()
+        else:
+            high_k_entropy = 0.0
+
+        return delta, {"attn_entropy": mean_entropy, "attn_entropy_high_k": high_k_entropy}

@@ -154,6 +154,112 @@ def test_l3_layer_deterministic():
     assert torch.allclose(out1, out2)
 
 
+# ---- L3 Diagnostics Tests ----
+
+def test_l3_layer_diagnostics():
+    """L3Layer.diagnostics() returns delta and entropy dict."""
+    layer = _make_l3(n_embd=16, n_emb=32, d_up=64, vocab_size=8)
+    x = torch.randn(2, 5, 16)
+    token_ids = torch.randint(0, 8, (2, 5))
+    delta, diag = layer.diagnostics(x, token_ids)
+    assert delta.shape == (2, 5, 16)
+    assert not torch.isnan(delta).any()
+    assert "attn_entropy" in diag
+    assert "attn_entropy_high_k" in diag
+    assert diag["attn_entropy"] >= 0
+
+
+def test_l3_layer_diagnostics_matches_forward():
+    """diagnostics() delta matches forward() delta."""
+    layer = _make_l3(n_embd=16, n_emb=32, d_up=64, vocab_size=8)
+    x = torch.randn(2, 5, 16)
+    token_ids = torch.randint(0, 8, (2, 5))
+    delta_fwd = layer(x, token_ids)
+    delta_diag, _ = layer.diagnostics(x, token_ids)
+    assert torch.allclose(delta_fwd, delta_diag, atol=1e-5)
+
+
+def test_gpt_l3_diagnostics_standard_mode():
+    """GPT.l3_diagnostics() returns expected keys in standard mode."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        l3_after_layers="2", l3_n_emb=128, l3_d_up=32, l3_k_max=16,
+        l3_lambda=True,
+    )
+    model = GPT(config)
+    model.init_weights()
+    alloc = compute_lzw_allocation([[0, 1, 2, 3] * 4], vocab_size=64, n_emb=128, k_max=16)
+    bounds = allocation_to_bounds(alloc)
+    for l3_layer in model.l3_layers.values():
+        l3_layer.set_bounds(bounds)
+    idx = torch.randint(0, 64, (1, 8))
+    metrics = model.l3_diagnostics(idx)
+    # Should have delta_ratio, attn_entropy (both), weight norms, and lambda for layer 2
+    assert "l3/delta_ratio_layer2" in metrics
+    assert "l3/attn_entropy_layer2" in metrics
+    assert "l3/attn_entropy_high_k_layer2" in metrics
+    assert "l3/w_up_norm_2" in metrics
+    assert "l3/w_mix_norm_2" in metrics
+    assert "l3/lambda_2" in metrics
+    # All values should be finite floats
+    for k, v in metrics.items():
+        assert isinstance(v, float), f"{k} is not float: {type(v)}"
+        assert not (v != v), f"{k} is NaN"  # NaN check
+
+
+def test_gpt_l3_diagnostics_looped_mode():
+    """GPT.l3_diagnostics() returns expected keys in looped mode."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        n_loops=3, l3_every_loops=1,
+        l3_n_emb=128, l3_d_up=32, l3_k_max=16,
+        l3_lambda=True,
+    )
+    model = GPT(config)
+    model.init_weights()
+    alloc = compute_lzw_allocation([[0, 1, 2, 3] * 4], vocab_size=64, n_emb=128, k_max=16)
+    bounds = allocation_to_bounds(alloc)
+    for l3_layer in model.l3_layers.values():
+        l3_layer.set_bounds(bounds)
+    idx = torch.randint(0, 64, (1, 8))
+    metrics = model.l3_diagnostics(idx)
+    # Loops 1 and 2 should have metrics
+    for loop in [1, 2]:
+        assert f"l3/delta_ratio_loop{loop}" in metrics
+        assert f"l3/attn_entropy_loop{loop}" in metrics
+        assert f"l3/attn_entropy_high_k_loop{loop}" in metrics
+        assert f"l3/w_up_norm_{loop}" in metrics
+        assert f"l3/w_mix_norm_{loop}" in metrics
+        assert f"l3/lambda_{loop}" in metrics
+
+
+def test_gpt_l3_diagnostics_no_lambda():
+    """GPT.l3_diagnostics() omits lambda keys when l3_lambda=False (the default)."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        l3_after_layers="2", l3_n_emb=128, l3_d_up=32, l3_k_max=16,
+    )
+    model = GPT(config)
+    model.init_weights()
+    alloc = compute_lzw_allocation([[0, 1, 2, 3] * 4], vocab_size=64, n_emb=128, k_max=16)
+    bounds = allocation_to_bounds(alloc)
+    for l3_layer in model.l3_layers.values():
+        l3_layer.set_bounds(bounds)
+    idx = torch.randint(0, 64, (1, 8))
+    metrics = model.l3_diagnostics(idx)
+    assert "l3/delta_ratio_layer2" in metrics
+    assert "l3/attn_entropy_layer2" in metrics
+    assert "l3/attn_entropy_high_k_layer2" in metrics
+    # No lambda keys
+    assert not any(k.startswith("l3/lambda_") for k in metrics)
+
+
 # ---- GPT Integration Tests ----
 
 def test_gpt_with_l3_forward():
@@ -254,13 +360,12 @@ def test_gpt_without_l3_unchanged():
 
 
 def test_gpt_with_l3_no_lambda():
-    """L3 without learnable lambda: forward+backward works, no l3_lambdas param."""
+    """L3 without learnable lambda (default): forward+backward works, no l3_lambdas param."""
     from nanochat.gpt import GPT, GPTConfig
     config = GPTConfig(
         sequence_len=8, vocab_size=64, n_layer=4,
         n_head=2, n_kv_head=2, n_embd=64,
         l3_after_layers="2", l3_n_emb=128, l3_d_up=32, l3_k_max=16,
-        l3_lambda=False,
     )
     model = GPT(config)
     assert model.l3_lambdas is None

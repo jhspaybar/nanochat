@@ -56,7 +56,7 @@ parser.add_argument("--l3-after-layers", type=str, default="", help="comma-separ
 parser.add_argument("--l3-n-emb", type=int, default=0, help="total L3 embeddings (0 = auto: 2x vocab_size)")
 parser.add_argument("--l3-d-up", type=int, default=0, help="L3 up-projection dim (0 = 4*n_embd)")
 parser.add_argument("--l3-k-max", type=int, default=32, help="max embeddings per token for L3")
-parser.add_argument("--l3-no-lambda", action="store_true", help="disable learnable L3 output scaling (default: enabled)")
+parser.add_argument("--l3-lambda", action="store_true", help="enable learnable L3 output scaling (default: disabled)")
 parser.add_argument("--l3-lzw-tokens", type=int, default=500_000_000, help="max tokens to scan for LZW allocation (default 500M)")
 # Looped transformer
 parser.add_argument("--loops", type=int, default=1, help="Number of loops through shared blocks (1 = standard)")
@@ -164,7 +164,7 @@ def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_
         l3_n_emb=l3_n_emb,
         l3_d_up=args.l3_d_up,
         l3_k_max=args.l3_k_max,
-        l3_lambda=not args.l3_no_lambda,
+        l3_lambda=args.l3_lambda,
         n_loops=n_loops,
         l3_every_loops=l3_every_loops,
         tbptl=tbptl,
@@ -640,11 +640,9 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
-        # L3 delta/residual ratio diagnostics (run outside torch.compile)
+        # L3 diagnostics (run outside torch.compile)
         if orig_model.l3_layers:
-            l3_ratios = orig_model.l3_diagnostics(x[:1])
-            for layer_idx, ratio in l3_ratios.items():
-                log_data[f"l3/delta_ratio_layer{layer_idx}"] = ratio
+            log_data.update(orig_model.l3_diagnostics(x[:1]))
         wandb_run.log(log_data, step=step)
 
     # state update
