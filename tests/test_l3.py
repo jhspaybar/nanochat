@@ -70,10 +70,10 @@ def test_lzw_allocation_ngram_last_token():
 
 # ---- L3Layer Tests ----
 
-def _make_l3(n_embd=16, n_emb=32, d_up=64, vocab_size=8, tie_kv=True):
+def _make_l3(n_embd=16, n_emb=32, d_up=64, vocab_size=8):
     """Helper to create an L3Layer with bounds set and properly initialized."""
     torch.manual_seed(42)
-    layer = L3Layer(n_embd=n_embd, n_emb=n_emb, d_up=d_up, tie_kv=tie_kv)
+    layer = L3Layer(n_embd=n_embd, n_emb=n_emb, d_up=d_up)
     # Initialize weights to avoid garbage values from torch.empty()
     for name, p in layer.named_parameters():
         if p.dim() >= 2:
@@ -116,25 +116,22 @@ def test_l3_layer_gradient_flow():
     assert x.grad is not None, "No gradient for input x"
 
 
-def test_l3_layer_tied_kv():
-    """Tied mode uses single weight matrix (kv_weight), no separate k/v."""
-    layer_tied = _make_l3(tie_kv=True)
-    layer_untied = _make_l3(tie_kv=False)
-    tied_params = {n for n, _ in layer_tied.named_parameters()}
-    untied_params = {n for n, _ in layer_untied.named_parameters()}
-    assert "kv_weight" in tied_params
-    assert "k_weight" not in tied_params
-    assert "v_weight" not in tied_params
-    assert "k_weight" in untied_params
-    assert "v_weight" in untied_params
-    assert "kv_weight" not in untied_params
+def test_l3_layer_params():
+    """L3Layer has kv_weight (tied K/V), w_up, w_mix."""
+    layer = _make_l3()
+    params = {n for n, _ in layer.named_parameters()}
+    assert "kv_weight" in params
+    assert "k_weight" not in params
+    assert "v_weight" not in params
+    assert "w_up.weight" in params
+    assert "w_mix.weight" in params
 
 
 def test_l3_layer_masking():
     """Tokens with fewer embeddings are properly masked (no NaN/inf)."""
     n_embd = 16
     # Non-uniform allocation: token 0 gets 10, token 1 gets 2
-    layer = L3Layer(n_embd=n_embd, n_emb=12, d_up=64, tie_kv=True)
+    layer = L3Layer(n_embd=n_embd, n_emb=12, d_up=64)
     bounds = torch.tensor([0, 10, 12, 12])  # 3 tokens: 10, 2, 0 embeddings
     # Token 2 has 0 embeddings - adjust to at least 1
     bounds = torch.tensor([0, 9, 11, 12])  # 3 tokens: 9, 2, 1
@@ -155,29 +152,6 @@ def test_l3_layer_deterministic():
     out1 = layer(x, token_ids)
     out2 = layer(x, token_ids)
     assert torch.allclose(out1, out2)
-
-
-def test_l3_layer_untied_output_shape():
-    """Untied mode also produces correct output shape."""
-    n_embd = 16
-    layer = _make_l3(n_embd=n_embd, n_emb=32, d_up=64, vocab_size=8, tie_kv=False)
-    x = torch.randn(2, 5, n_embd)
-    token_ids = torch.randint(0, 8, (2, 5))
-    out = layer(x, token_ids)
-    assert out.shape == (2, 5, n_embd)
-
-
-def test_l3_layer_untied_gradient_flow():
-    """All parameters receive gradients in untied mode."""
-    layer = _make_l3(n_embd=16, n_emb=32, d_up=64, vocab_size=8, tie_kv=False)
-    x = torch.randn(2, 5, 16, requires_grad=True)
-    token_ids = torch.randint(0, 8, (2, 5))
-    out = layer(x, token_ids)
-    loss = out.sum()
-    loss.backward()
-    for name, p in layer.named_parameters():
-        assert p.grad is not None, f"No gradient for {name}"
-        assert p.grad.abs().sum() > 0, f"Zero gradient for {name}"
 
 
 # ---- GPT Integration Tests ----
@@ -277,6 +251,30 @@ def test_gpt_without_l3_unchanged():
     loss = model(x, y)
     assert loss.ndim == 0
     assert not torch.isnan(loss)
+
+
+def test_gpt_with_l3_no_lambda():
+    """L3 without learnable lambda: forward+backward works, no l3_lambdas param."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        l3_after_layers="2", l3_n_emb=128, l3_d_up=32, l3_k_max=16,
+        l3_lambda=False,
+    )
+    model = GPT(config)
+    assert model.l3_lambdas is None
+    model.init_weights()
+    alloc = compute_lzw_allocation([[0, 1, 2, 3] * 4], vocab_size=64, n_emb=128, k_max=16)
+    bounds = allocation_to_bounds(alloc)
+    for l3_layer in model.l3_layers.values():
+        l3_layer.set_bounds(bounds)
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+    loss.backward()
 
 
 # ---- Looped Transformer Tests ----
@@ -629,3 +627,122 @@ def test_gpt_swiglu_with_loops():
     loss.backward()
     for name, p in model.named_parameters():
         assert p.grad is not None, f"No gradient for {name}"
+
+
+# ---- Skewed Allocation L3 Tests ----
+
+def _make_l3_skewed(n_embd=16, d_up=64, alloc=None):
+    """Helper to create an L3Layer with a skewed (non-uniform) allocation."""
+    if alloc is None:
+        alloc = [1] * 90 + [100]  # 90 tokens with 1 emb, 1 token with 100
+    n_emb = sum(alloc)
+    vocab_size = len(alloc)
+    torch.manual_seed(42)
+    layer = L3Layer(n_embd=n_embd, n_emb=n_emb, d_up=d_up,
+                    vocab_size=vocab_size, k_max=max(alloc))
+    for p in layer.parameters():
+        if p.dim() >= 2:
+            torch.nn.init.normal_(p, std=0.1)
+        else:
+            torch.nn.init.zeros_(p)
+    bounds = allocation_to_bounds(alloc)
+    layer.set_bounds(bounds)
+    return layer
+
+
+def test_skewed_alloc_no_embeddings_dropped():
+    """Every token uses ALL its allocated embeddings — none are truncated."""
+    alloc = [1] * 90 + [100]  # token 90 has 100 embeddings
+    layer = _make_l3_skewed(alloc=alloc)
+    x = torch.randn(2, 5, 16, requires_grad=True)
+    # Force token 90 into the batch to exercise the high-k path
+    token_ids = torch.zeros(2, 5, dtype=torch.long)
+    token_ids[0, 0] = 90  # this token has 100 embeddings
+    out = layer(x, token_ids)
+    assert out.shape == (2, 5, 16)
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()
+    # Verify the high-k token's embeddings all received gradient
+    out.sum().backward()
+    grad = layer.kv_weight.grad
+    # Token 90 starts at index 90 (90 tokens × 1 embedding), has 100 rows
+    high_k_grad = grad[90:190]
+    assert high_k_grad.abs().sum() > 0, "High-k token embeddings should receive gradient"
+
+
+def test_skewed_alloc_forward():
+    """Skewed allocation: forward+backward works."""
+    layer = _make_l3_skewed()
+    x = torch.randn(2, 5, 16, requires_grad=True)
+    token_ids = torch.randint(0, 91, (2, 5))
+    out = layer(x, token_ids)
+    assert out.shape == (2, 5, 16)
+    assert not torch.isnan(out).any()
+    out.sum().backward()
+    for name, p in layer.named_parameters():
+        assert p.grad is not None, f"No gradient for {name}"
+    assert x.grad is not None
+
+
+def test_uniform_alloc_deterministic():
+    """Uniform allocation: forward is deterministic."""
+    torch.manual_seed(42)
+    layer = _make_l3(n_embd=16, n_emb=32, d_up=64, vocab_size=8)
+    x = torch.randn(2, 5, 16)
+    token_ids = torch.randint(0, 8, (2, 5))
+    # Forward is deterministic
+    out1 = layer(x, token_ids)
+    out2 = layer(x, token_ids)
+    assert torch.allclose(out1, out2, atol=1e-6)
+
+
+def test_large_k_max_forward_backward():
+    """Large k_max with many embeddings: forward+backward works."""
+    torch.manual_seed(42)
+    alloc = [2] * 50 + [200]  # 51 tokens, k_max=200
+    layer = _make_l3_skewed(alloc=alloc)
+    x = torch.randn(2, 5, 16, requires_grad=True)
+    token_ids = torch.randint(0, 51, (2, 5))
+    out = layer(x, token_ids)
+    assert out.shape == (2, 5, 16)
+    assert not torch.isnan(out).any()
+    out.sum().backward()
+    assert layer.kv_weight.grad is not None
+
+
+def test_all_high_k_tokens():
+    """Batch where every token has many embeddings still works."""
+    alloc = [50] * 8  # every token has 50 embeddings
+    layer = _make_l3_skewed(alloc=alloc)
+    x = torch.randn(2, 5, 16, requires_grad=True)
+    token_ids = torch.randint(0, 8, (2, 5))
+    out = layer(x, token_ids)
+    assert out.shape == (2, 5, 16)
+    assert not torch.isnan(out).any()
+    out.sum().backward()
+    assert x.grad is not None
+
+
+def test_gpt_with_l3_large_k_forward():
+    """Full model with large k_max L3 runs forward pass."""
+    from nanochat.gpt import GPT, GPTConfig
+    config = GPTConfig(
+        sequence_len=8, vocab_size=64, n_layer=4,
+        n_head=2, n_kv_head=2, n_embd=64,
+        l3_after_layers="2", l3_n_emb=640, l3_d_up=32, l3_k_max=64,
+    )
+    model = GPT(config)
+    model.init_weights()
+    alloc = compute_lzw_allocation([[0, 1, 2, 3] * 4], vocab_size=64, n_emb=640, k_max=64)
+    bounds = allocation_to_bounds(alloc)
+    for l3_layer in model.l3_layers.values():
+        l3_layer.set_bounds(bounds)
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    loss = model(x, y)
+    assert loss.ndim == 0
+    assert not torch.isnan(loss)
+    loss.backward()
+    for name, p in model.l3_layers.named_parameters():
+        if 'bounds' not in name:
+            assert p.grad is not None, f"No gradient for L3 param {name}"

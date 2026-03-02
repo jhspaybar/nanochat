@@ -22,7 +22,7 @@ def _make_realistic_l3(n_embd=384, vocab_size=32768, n_emb=None, d_up=None, k_ma
         d_up = 4 * n_embd
 
     torch.manual_seed(42)
-    layer = L3Layer(n_embd=n_embd, n_emb=n_emb, d_up=d_up, tie_kv=True)
+    layer = L3Layer(n_embd=n_embd, n_emb=n_emb, d_up=d_up)
 
     for name, p in layer.named_parameters():
         if p.dim() >= 2:

@@ -43,7 +43,7 @@ class GPTConfig:
     l3_n_emb: int = 0           # total embeddings (0 = disabled)
     l3_d_up: int = 0            # up-projection dim (0 = auto: 4 * n_embd)
     l3_k_max: int = 32          # max embeddings per token
-    l3_tie_kv: bool = True      # tie key and value weights
+    l3_lambda: bool = True      # learnable per-L3-layer scaling (False = unscaled residual)
     # Looped transformer config
     n_loops: int = 1            # times to loop through blocks (1 = standard)
     l3_every_loops: int = 0     # insert L3 every N loop boundaries (0 = disabled, only when n_loops > 1)
@@ -234,7 +234,7 @@ class GPT(nn.Module):
             if config.l3_d_up == 0 and self._l3_loop_indices and config.l3_n_emb > 0:
                 config.l3_d_up = l3_d_up
             self.l3_layers = nn.ModuleDict({
-                str(loop): L3Layer(config.n_embd, config.l3_n_emb, l3_d_up, config.l3_tie_kv,
+                str(loop): L3Layer(config.n_embd, config.l3_n_emb, l3_d_up,
                                    vocab_size=config.vocab_size, k_max=config.l3_k_max)
                 for loop in self._l3_loop_indices
             }) if self._l3_loop_indices and config.l3_n_emb > 0 else nn.ModuleDict()
@@ -246,14 +246,14 @@ class GPT(nn.Module):
             if config.l3_d_up == 0 and self.l3_layer_indices:
                 config.l3_d_up = l3_d_up
             self.l3_layers = nn.ModuleDict({
-                str(i): L3Layer(config.n_embd, config.l3_n_emb, l3_d_up, config.l3_tie_kv,
+                str(i): L3Layer(config.n_embd, config.l3_n_emb, l3_d_up,
                                 vocab_size=config.vocab_size, k_max=config.l3_k_max)
                 for i in self.l3_layer_indices
             }) if self.l3_layer_indices and config.l3_n_emb > 0 else nn.ModuleDict()
             sorted_l3 = sorted(self.l3_layer_indices) if self.l3_layer_indices else []
         # L3 per-layer learnable scaling (like resid_lambdas for the residual stream)
         self._l3_lambda_map = {i: pos for pos, i in enumerate(sorted_l3)}
-        self.l3_lambdas = nn.Parameter(torch.ones(len(sorted_l3))) if sorted_l3 else None
+        self.l3_lambdas = nn.Parameter(torch.ones(len(sorted_l3))) if (sorted_l3 and config.l3_lambda) else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -317,13 +317,12 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
-        # L3 layers
+        # L3 layers: kv_weight uses Llama-style init (std=1/sqrt(n_embd)) so that
+        # attention logits have O(1) variance at init, giving smooth softmax.
+        # std=1.0 would give logits with std≈sqrt(n_embd)≈28, making softmax one-hot.
+        l3_std = n_embd ** -0.5
         for l3_layer in self.l3_layers.values():
-            if l3_layer.tie_kv:
-                torch.nn.init.normal_(l3_layer.kv_weight, mean=0.0, std=1.0)
-            else:
-                torch.nn.init.normal_(l3_layer.k_weight, mean=0.0, std=1.0)
-                torch.nn.init.normal_(l3_layer.v_weight, mean=0.0, std=1.0)
+            torch.nn.init.normal_(l3_layer.kv_weight, mean=0.0, std=l3_std)
             torch.nn.init.uniform_(l3_layer.w_up.weight, -s, s)
             torch.nn.init.zeros_(l3_layer.w_mix.weight)  # Zero init (consistent with c_proj pattern)
         if self.l3_lambdas is not None:
@@ -340,11 +339,7 @@ class GPT(nn.Module):
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
             for l3_layer in self.l3_layers.values():
-                if l3_layer.tie_kv:
-                    l3_layer.kv_weight.data = l3_layer.kv_weight.data.to(dtype=torch.bfloat16)
-                else:
-                    l3_layer.k_weight.data = l3_layer.k_weight.data.to(dtype=torch.bfloat16)
-                    l3_layer.v_weight.data = l3_layer.v_weight.data.to(dtype=torch.bfloat16)
+                l3_layer.kv_weight.data = l3_layer.kv_weight.data.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -395,6 +390,12 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def _l3_scale(self, key):
+        """Return the learnable L3 scale for the given layer/loop key, or 1 if disabled."""
+        if self.l3_lambdas is not None:
+            return self.l3_lambdas[self._l3_lambda_map[key]]
+        return 1
+
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -414,10 +415,7 @@ class GPT(nn.Module):
         l3_embed_numel = 0
         l3_matrix_numel = 0
         for l3_layer in self.l3_layers.values():
-            if l3_layer.tie_kv:
-                l3_embed_numel += l3_layer.kv_weight.numel()
-            else:
-                l3_embed_numel += l3_layer.k_weight.numel() + l3_layer.v_weight.numel()
+            l3_embed_numel += l3_layer.kv_weight.numel()
             l3_matrix_numel += l3_layer.w_up.weight.numel() + l3_layer.w_mix.weight.numel()
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel + l3_embed_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
@@ -467,10 +465,7 @@ class GPT(nn.Module):
         l3_embeds = 0
         l3_matrices = 0
         for l3_layer in self.l3_layers.values():
-            if l3_layer.tie_kv:
-                l3_embeds += l3_layer.kv_weight.numel()
-            else:
-                l3_embeds += l3_layer.k_weight.numel() + l3_layer.v_weight.numel()
+            l3_embeds += l3_layer.kv_weight.numel()
             l3_matrices += l3_layer.w_up.weight.numel() + l3_layer.w_mix.weight.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars + l3_embeds + l3_matrices
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
@@ -502,16 +497,12 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        # L3 params: embedding-like (kv/k/v weights), matrix (w_up, w_mix), and scalars (l3_lambdas)
+        # L3 params: embedding-like (kv weights), matrix (w_up, w_mix), and scalars (l3_lambdas)
         l3_embed_params = []
         l3_matrix_params = []
         l3_scalar_params = [self.l3_lambdas] if self.l3_lambdas is not None else []
         for l3_layer in self.l3_layers.values():
-            if l3_layer.tie_kv:
-                l3_embed_params.append(l3_layer.kv_weight)
-            else:
-                l3_embed_params.append(l3_layer.k_weight)
-                l3_embed_params.append(l3_layer.v_weight)
+            l3_embed_params.append(l3_layer.kv_weight)
             l3_matrix_params.append(l3_layer.w_up.weight)
             l3_matrix_params.append(l3_layer.w_mix.weight)
         assert len(list(self.parameters())) == len(matrix_params) + len(block_scalar_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params) + len(l3_scalar_params)
@@ -578,7 +569,7 @@ class GPT(nn.Module):
                     for loop in range(tbptl):
                         l3_key = str(loop)
                         if loop > 0 and l3_key in self.l3_layers:
-                            x = x + self.l3_lambdas[self._l3_lambda_map[loop]] * self.l3_layers[l3_key](x, idx)
+                            x = x + self._l3_scale(loop) * self.l3_layers[l3_key](x, idx)
                         if kv_cache is not None:
                             kv_cache.layer_offset = loop * n_layer
                         for i, block in enumerate(self.transformer.h):
@@ -589,7 +580,7 @@ class GPT(nn.Module):
             for loop in range(tbptl, self.config.n_loops):
                 l3_key = str(loop)
                 if loop > 0 and l3_key in self.l3_layers:
-                    x = x + self.l3_lambdas[self._l3_lambda_map[loop]] * self.l3_layers[l3_key](x, idx)
+                    x = x + self._l3_scale(loop) * self.l3_layers[l3_key](x, idx)
                 if kv_cache is not None:
                     kv_cache.layer_offset = loop * n_layer
                 for i, block in enumerate(self.transformer.h):
@@ -604,7 +595,7 @@ class GPT(nn.Module):
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
                 # L3 layer after this block (if configured)
                 if str(i) in self.l3_layers:
-                    x = x + self.l3_lambdas[self._l3_lambda_map[i]] * self.l3_layers[str(i)](x, idx)
+                    x = x + self._l3_scale(i) * self.l3_layers[str(i)](x, idx)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -640,7 +631,7 @@ class GPT(nn.Module):
             for loop in range(self.config.n_loops):
                 l3_key = str(loop)
                 if loop > 0 and l3_key in self.l3_layers:
-                    l3_delta = self.l3_lambdas[self._l3_lambda_map[loop]] * self.l3_layers[l3_key](x, idx)
+                    l3_delta = self._l3_scale(loop) * self.l3_layers[l3_key](x, idx)
                     ratios[f"loop{loop}"] = (l3_delta.norm() / (x.norm() + 1e-8)).item()
                     x = x + l3_delta
                 for i, block in enumerate(self.transformer.h):
@@ -654,7 +645,7 @@ class GPT(nn.Module):
                 ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
                 x = block(x, ve, cos_sin, self.window_sizes[i], None)
                 if str(i) in self.l3_layers:
-                    l3_delta = self.l3_lambdas[self._l3_lambda_map[i]] * self.l3_layers[str(i)](x, idx)
+                    l3_delta = self._l3_scale(i) * self.l3_layers[str(i)](x, idx)
                     ratios[i] = (l3_delta.norm() / (x.norm() + 1e-8)).item()
                     x = x + l3_delta
         return ratios

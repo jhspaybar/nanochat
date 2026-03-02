@@ -56,6 +56,7 @@ parser.add_argument("--l3-after-layers", type=str, default="", help="comma-separ
 parser.add_argument("--l3-n-emb", type=int, default=0, help="total L3 embeddings (0 = auto: 2x vocab_size)")
 parser.add_argument("--l3-d-up", type=int, default=0, help="L3 up-projection dim (0 = 4*n_embd)")
 parser.add_argument("--l3-k-max", type=int, default=32, help="max embeddings per token for L3")
+parser.add_argument("--l3-no-lambda", action="store_true", help="disable learnable L3 output scaling (default: enabled)")
 parser.add_argument("--l3-lzw-tokens", type=int, default=500_000_000, help="max tokens to scan for LZW allocation (default 500M)")
 # Looped transformer
 parser.add_argument("--loops", type=int, default=1, help="Number of loops through shared blocks (1 = standard)")
@@ -89,7 +90,6 @@ parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bp
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--core-metric-batch", type=int, default=4, help="max choices to forward at once for CORE eval (lower = less memory)")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--log-every", type=int, default=100, help="log training metrics to wandb every N steps")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
@@ -164,6 +164,7 @@ def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_
         l3_n_emb=l3_n_emb,
         l3_d_up=args.l3_d_up,
         l3_k_max=args.l3_k_max,
+        l3_lambda=not args.l3_no_lambda,
         n_loops=n_loops,
         l3_every_loops=l3_every_loops,
         tbptl=tbptl,
@@ -417,8 +418,9 @@ if orig_model.l3_layers:
     dt_lzw = time.time() - t0_lzw
     # Print allocation summary with distribution histogram
     alloc_t = torch.tensor(l3_alloc)
-    print0(f"L3 allocation: {l3_n_emb:,} embeddings, k_max={args.l3_k_max}, avg={l3_n_emb/vocab_size:.1f}/token "
-           f"({lzw_token_cap:,} tokens scanned in {dt_lzw:.1f}s)")
+    actual_k_max = max(l3_alloc)
+    print0(f"L3 allocation: {l3_n_emb:,} embeddings, k_max_cfg={args.l3_k_max}, k_max_actual={actual_k_max}, "
+           f"avg={l3_n_emb/vocab_size:.1f}/token ({lzw_token_cap:,} tokens scanned in {dt_lzw:.1f}s)")
     buckets = [(1, 1), (2, 2), (3, 4), (5, 8), (9, 16), (17, 32), (33, 64), (65, 128), (129, 256), (257, 512)]
     counts = []
     for lo, hi in buckets:
@@ -514,7 +516,7 @@ while True:
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
         with disable_fp8(orig_model), autocast_ctx:
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task, max_batch=args.core_metric_batch)
+            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,

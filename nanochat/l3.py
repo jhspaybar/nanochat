@@ -5,9 +5,19 @@ Ref: arXiv:2601.21461v2
 L3 generalizes token embeddings by placing per-token lookup tables inside
 the decoder stack. Unlike MoE, routing is static (determined by token ID),
 eliminating router training and load-balancing losses.
-"""
 
-from collections import Counter
+Forward pass uses the block-diagonal approach from Section A.3.4 of the paper:
+1. Sort all tokens by ID (groups identical tokens together)
+2. Build de-duplicated embedding pool for the sorted sequence
+3. Process blocks of bb sorted tokens with masked attention
+   (each token attends only to its own embeddings via masking)
+4. Unsort results back to original order
+5. Up-project, norm, concat with input, mix-project
+
+This avoids padding every token to k_max — tokens share embedding pools
+within blocks, and masking handles per-token selection. Much more memory-
+efficient than per-token padding for large k_max.
+"""
 
 import torch
 import torch.nn as nn
@@ -117,33 +127,32 @@ def allocation_to_bounds(alloc):
 
 class L3Layer(nn.Module):
     """
-    L3 layer: per-token lookup table with attention-like aggregation.
+    L3 layer: per-token lookup table with block-diagonal attention.
 
-    Forward pass:
-    1. Norm input (pre-norm, same as backbone)
-    2. Look up per-token K/V embeddings, pad to k_max, mask invalid
-    3. Compute scores, softmax, aggregate
-    4. Up-project, norm, concat with x, mix-project
+    Following arXiv:2601.21461v2 Section A.3.4:
+    1. Sort tokens by ID -> groups identical tokens together
+    2. Build de-duplicated embedding pool for sorted sequence
+    3. Process blocks of bb sorted tokens with masked attention
+       (each token attends only to its own embeddings)
+    4. Unsort results back to original order
+    5. Up-project, norm, concat with input, mix-project
+
+    K/V are always tied (single kv_weight table used as both keys and values).
     Returns the delta (added residually by caller).
     """
 
-    def __init__(self, n_embd, n_emb, d_up, tie_kv=True, vocab_size=0, k_max=32):
+    def __init__(self, n_embd, n_emb, d_up, vocab_size=0, k_max=32, bb=512):
         super().__init__()
         self.n_embd = n_embd
         self.n_emb = n_emb
         self.d_up = d_up
-        self.tie_kv = tie_kv
         self.k_max = k_max
+        self.bb = bb
 
-        if tie_kv:
-            # Single shared weight for both keys and values
-            self.kv_weight = nn.Parameter(torch.empty(n_emb, n_embd))
-        else:
-            # Separate key and value weights
-            self.k_weight = nn.Parameter(torch.empty(n_emb, n_embd))
-            self.v_weight = nn.Parameter(torch.empty(n_emb, n_embd))
+        # Single weight table for both keys and values (tied KV)
+        self.kv_weight = nn.Parameter(torch.empty(n_emb, n_embd))
 
-        # Up-project from d_emb (= n_embd when tied) to d_up
+        # Up-project from n_embd to d_up
         self.w_up = nn.Linear(n_embd, d_up, bias=False)
         # Mix-project: concat(up_projected, x) -> n_embd
         self.w_mix = nn.Linear(d_up + n_embd, n_embd, bias=False)
@@ -151,13 +160,20 @@ class L3Layer(nn.Module):
         # Bounds buffer: sized for vocab so checkpoint loading works without shape mismatch
         bounds_size = (vocab_size + 1) if vocab_size > 0 else 1
         self.register_buffer("bounds", torch.zeros(bounds_size, dtype=torch.long), persistent=True)
+        # emb_alloc[j] = token ID that embedding j belongs to (rebuilt by set_bounds, not saved)
+        self.register_buffer("emb_alloc", torch.zeros(max(n_emb, 1), dtype=torch.long), persistent=False)
 
     def set_bounds(self, bounds):
-        """Register the precomputed bounds tensor as a buffer."""
+        """Register bounds tensor and build derived emb_alloc mapping."""
         self.bounds = bounds
         alloc = bounds[1:] - bounds[:-1]
         self.k_max = int(alloc.max().item())
+        # emb_alloc[j] = token ID for embedding j
+        self.emb_alloc = torch.repeat_interleave(
+            torch.arange(len(alloc), device=bounds.device, dtype=torch.long), alloc
+        )
 
+    @torch._dynamo.disable
     def forward(self, x, token_ids):
         """
         Args:
@@ -168,48 +184,77 @@ class L3Layer(nn.Module):
         """
         B, T, C = x.shape
         N = B * T
+        bb = self.bb
 
         # Pre-norm (same as backbone)
         q = norm(x).reshape(N, C)
+        flat_ids = token_ids.reshape(-1)  # [N]
 
-        # Look up per-token embedding bounds
-        flat_ids = token_ids.reshape(-1)                    # [N]
-        starts = self.bounds[flat_ids]                      # [N]
-        lengths = self.bounds[flat_ids + 1] - starts        # [N]
-        k_max = self.k_max
+        # Sort tokens by ID — groups identical tokens together for efficient blocking
+        seq_sort, fw = torch.sort(flat_ids, stable=True)
+        bw = torch.empty_like(fw)
+        bw[fw] = torch.arange(N, device=x.device)
+        q_sorted = q[fw]  # [N, C]
 
-        # Padded attention over per-token embeddings
-        # Chunked for MPS compatibility (intermediate tensors must stay under INT_MAX)
-        max_chunk = max(1, (2**30) // max(k_max * C, 1))
-        agg_parts = []
-        for i in range(0, N, max_chunk):
-            j = min(i + max_chunk, N)
+        # Build de-duplicated embedding pool for sorted sequence.
+        # Since tokens are sorted, unique_consecutive gives runs of identical IDs.
+        unique, inverse, counts = torch.unique_consecutive(
+            seq_sort, return_inverse=True, return_counts=True
+        )
+        unique_emb_starts = self.bounds[unique]            # [n_unique]
+        unique_emb_ends = self.bounds[unique + 1]          # [n_unique]
+        unique_emb_lengths = unique_emb_ends - unique_emb_starts  # [n_unique]
 
-            # Build padded index tensor and validity mask
-            offsets = torch.arange(k_max, device=x.device)             # [k_max]
-            idx = starts[i:j, None] + offsets[None, :]                 # [n, k_max]
-            valid = offsets[None, :] < lengths[i:j, None]              # [n, k_max]
-            idx = idx.clamp(0, self.n_emb - 1)
+        # Cumulative offsets in the gathered embedding pool
+        unique_offsets = torch.zeros(len(unique) + 1, dtype=torch.long, device=x.device)
+        unique_offsets[1:] = torch.cumsum(unique_emb_lengths, dim=0)
+        total_embs = int(unique_offsets[-1].item())
 
-            # Gather K/V embeddings
-            if self.tie_kv:
-                kv = self.kv_weight[idx]                               # [n, k_max, C]
-                scores = torch.bmm(kv, q[i:j, :, None]).squeeze(2)    # [n, k_max]
-                scores = scores.masked_fill(~valid, float('-inf'))
-                w = F.softmax(scores, dim=-1).masked_fill(~valid, 0.0)
-                agg_parts.append(torch.bmm(w[:, None, :], kv).squeeze(1))
-            else:
-                k = self.k_weight[idx]                                 # [n, k_max, C]
-                v = self.v_weight[idx]                                 # [n, k_max, C]
-                scores = torch.bmm(k, q[i:j, :, None]).squeeze(2)
-                scores = scores.masked_fill(~valid, float('-inf'))
-                w = F.softmax(scores, dim=-1).masked_fill(~valid, 0.0)
-                agg_parts.append(torch.bmm(w[:, None, :], v).squeeze(1))
+        # Build keep_cols: indices into the full embedding table.
+        # Uses "batched arange" to avoid Python loops:
+        # keep_cols[unique_offsets[j]:unique_offsets[j+1]] = range(bounds[unique[j]], bounds[unique[j]+1])
+        flat_pos = torch.arange(total_embs, device=x.device)
+        base_off = torch.repeat_interleave(unique_offsets[:-1], unique_emb_lengths)
+        local_pos = flat_pos - base_off
+        base_starts = torch.repeat_interleave(unique_emb_starts, unique_emb_lengths)
+        keep_cols = base_starts + local_pos
 
-        agg = torch.cat(agg_parts, dim=0).view(B, T, C)
+        # Per sorted position: start/end range in the gathered pool
+        starts = unique_offsets[inverse]       # [N]
+        ends = unique_offsets[inverse + 1]     # [N]
+
+        # Gather KV embeddings for all relevant tokens
+        emb_ids = self.emb_alloc[keep_cols]    # [total_embs] — token ID per embedding
+        KV = self.kv_weight[keep_cols]         # [total_embs, C]
+
+        # Block-diagonal attention: iterate over blocks of bb sorted tokens.
+        # Within each block, each token attends only to its own embeddings (via masking).
+        # Because tokens are sorted, same-ID tokens are grouped → tight embedding pools.
+        out_parts = []
+        for block_start in range(0, N, bb):
+            block_end = min(block_start + bb, N)
+            block_q = q_sorted[block_start:block_end]         # [bs, C]
+            block_ids = seq_sort[block_start:block_end]        # [bs]
+
+            # Embedding pool for this block: contiguous range due to sorting
+            emb_s = int(starts[block_start].item())
+            emb_e = int(ends[block_end - 1].item())
+            b_emb_ids = emb_ids[emb_s:emb_e]                  # [n_embs]
+            bKV = KV[emb_s:emb_e]                              # [n_embs, C]
+
+            # Masked attention: score, mask, softmax, aggregate
+            score = block_q @ bKV.T                            # [bs, n_embs]
+            mask = block_ids.unsqueeze(1) == b_emb_ids.unsqueeze(0)  # [bs, n_embs]
+            score = score.masked_fill(~mask, float('-inf'))
+            w = F.softmax(score, dim=-1).masked_fill(~mask, 0.0)
+            out_parts.append(w @ bKV)                          # [bs, C]
+
+        out = torch.cat(out_parts, dim=0)  # [N, C]
+
+        # Unsort back to original order
+        agg = out[bw].view(B, T, C)
 
         # Up-project, norm, concat with input, mix-project
         up = norm(self.w_up(agg))
         delta = self.w_mix(torch.cat([up, x], dim=-1))
-
         return delta

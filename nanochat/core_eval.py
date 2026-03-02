@@ -142,21 +142,12 @@ def batch_sequences_lm(tokenizer, prompts):
 
 
 @torch.no_grad()
-def forward_model(model, input_ids, max_batch=0):
+def forward_model(model, input_ids):
     """
     Take BxT tensor of token ids, return BxT tensor of losses and argmax predictions.
     The last column of losses is set to nan because we don't have autoregressive targets there.
-    If max_batch > 0, process in sub-batches to limit memory usage.
     """
     batch_size, seq_len = input_ids.size()
-    if max_batch > 0 and batch_size > max_batch:
-        # Process in chunks to avoid OOM on tasks with many choices (e.g. bigbench)
-        all_losses, all_preds = [], []
-        for i in range(0, batch_size, max_batch):
-            chunk_losses, chunk_preds = forward_model(model, input_ids[i:i+max_batch], max_batch=0)
-            all_losses.append(chunk_losses)
-            all_preds.append(chunk_preds)
-        return torch.cat(all_losses, dim=0), torch.cat(all_preds, dim=0)
     outputs = model(input_ids)
     # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
@@ -227,8 +218,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     input_ids = input_ids.to(device)
 
     # Forward the model, get the autoregressive loss and argmax prediction at each token
-    max_batch = task_meta.get('max_batch', 0)
-    losses, predictions = forward_model(model, input_ids, max_batch=max_batch)
+    losses, predictions = forward_model(model, input_ids)
 
     # See if the losses/predictions come out correctly
     if task_type == 'language_modeling':
