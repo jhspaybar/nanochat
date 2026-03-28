@@ -144,7 +144,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             'task_type': task['icl_task_type'],
             'dataset_uri': task['dataset_uri'],
             'num_fewshot': task['num_fewshot'][0],
-            'continuation_delimiter': task.get('continuation_delimiter', ' ')
+            'continuation_delimiter': task.get('continuation_delimiter', ' '),
         }
         print0(f"Evaluating: {label} ({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})... ", end='')
 

@@ -51,6 +51,22 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# L3 (Large Lookup Layers)
+parser.add_argument("--l3-after-layers", type=str, default="", help="comma-separated layer indices for L3 (empty = disabled)")
+parser.add_argument("--l3-n-emb", type=int, default=0, help="total L3 embeddings (0 = auto: 2x vocab_size)")
+parser.add_argument("--l3-d-up", type=int, default=0, help="L3 up-projection dim (0 = 4*n_embd)")
+parser.add_argument("--l3-k-max", type=int, default=32, help="max embeddings per token for L3")
+parser.add_argument("--l3-lambda", action="store_true", help="enable learnable L3 output scaling (default: disabled)")
+parser.add_argument("--l3-lzw-tokens", type=int, default=500_000_000, help="max tokens to scan for LZW allocation (default 500M)")
+# Looped transformer
+parser.add_argument("--loops", type=int, default=1, help="Number of loops through shared blocks (1 = standard)")
+parser.add_argument("--l3-every-loops", type=int, default=0, help="Insert L3 every N loop boundaries (0 = disabled, requires --loops>1)")
+parser.add_argument("--tbptl", type=int, default=0, help="Truncated backprop: forward-only for first N loops (0 = disabled)")
+# MLP type
+parser.add_argument("--mlp", type=str, default="relu2", choices=["relu2", "swiglu", "convswiglu"],
+                    help="MLP type: relu2 (default), swiglu (gated SiLU), or convswiglu (SwiGLU + depthwise conv)")
+# MPS acceleration
+parser.add_argument("--mps-flash", action="store_true", help="enable Metal Flash Attention on MPS (requires metal-flash-sdpa)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -75,16 +91,25 @@ parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number o
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--log-every", type=int, default=100, help="log training metrics to wandb every N steps")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+if args.loops > 1 and args.l3_after_layers:
+    parser.error("--l3-after-layers and --loops>1 are mutually exclusive")
+if args.tbptl >= args.loops:
+    parser.error("--tbptl must be less than --loops")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+if args.mps_flash and device_type == "mps":
+    from nanochat.flash_attention import enable_mps_flash
+    enable_mps_flash()
+    print("Metal Flash Attention enabled")
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
@@ -103,6 +128,8 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 # Flash Attention status
 if HAS_FA3:
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+elif args.mps_flash and device_type == "mps":
+    print0("✓ Using Metal Flash Attention on MPS")
 else:
     print0("!" * 80)
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
@@ -122,7 +149,7 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
+def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_loops=1, tbptl=0, mlp_type="relu2"):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
@@ -133,13 +160,34 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        l3_after_layers=l3_after_layers,
+        l3_n_emb=l3_n_emb,
+        l3_d_up=args.l3_d_up,
+        l3_k_max=args.l3_k_max,
+        l3_lambda=args.l3_lambda,
+        n_loops=n_loops,
+        l3_every_loops=l3_every_loops,
+        tbptl=tbptl,
+        mlp_type=mlp_type,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
     return model_meta
 
+# L3 precomputation part 1: auto-derive n_emb (needed before model build)
+# Standard mode: auto-derive when --l3-after-layers is set
+# Looped mode: auto-derive when --l3-every-loops > 0
+l3_n_emb = args.l3_n_emb
+if args.l3_after_layers or (args.loops > 1 and args.l3_every_loops > 0):
+    if l3_n_emb == 0:
+        # Default: ~2x vocab size (paper uses 710K for 180K vocab ≈ 3.9x; 2x is conservative)
+        l3_n_emb = 2 * vocab_size
+        print0(f"Auto-derived L3 n_emb: {l3_n_emb:,} (2x vocab_size)")
+
 # Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=l3_n_emb,
+                         n_loops=args.loops, l3_every_loops=args.l3_every_loops, tbptl=args.tbptl,
+                         mlp_type=args.mlp) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
@@ -346,6 +394,47 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
+# L3 precomputation part 2: LZW allocation over the full training token budget
+if orig_model.l3_layers:
+    from nanochat.l3 import compute_lzw_allocation, allocation_to_bounds
+    t0_lzw = time.time()
+    # Stream training data as token sequences for LZW analysis (capped for speed)
+    lzw_token_cap = min(args.l3_lzw_tokens, total_tokens)
+    def _l3_token_sequences():
+        loader = tokenizing_distributed_data_loader_bos_bestfit(
+            tokenizer, args.device_batch_size, args.max_seq_len, split="train", device="cpu")
+        tokens_seen = 0
+        while tokens_seen < lzw_token_cap:
+            x_batch, _ = next(loader)
+            for row in x_batch:
+                yield row.tolist()
+                tokens_seen += row.shape[0]
+                if tokens_seen >= lzw_token_cap:
+                    return
+    l3_alloc = compute_lzw_allocation(_l3_token_sequences(), vocab_size, l3_n_emb, args.l3_k_max)
+    l3_bounds = allocation_to_bounds(l3_alloc).to(device)
+    for l3_layer in orig_model.l3_layers.values():
+        l3_layer.set_bounds(l3_bounds)
+    dt_lzw = time.time() - t0_lzw
+    # Print allocation summary with distribution histogram
+    alloc_t = torch.tensor(l3_alloc)
+    actual_k_max = max(l3_alloc)
+    print0(f"L3 allocation: {l3_n_emb:,} embeddings, k_max_cfg={args.l3_k_max}, k_max_actual={actual_k_max}, "
+           f"avg={l3_n_emb/vocab_size:.1f}/token ({lzw_token_cap:,} tokens scanned in {dt_lzw:.1f}s)")
+    buckets = [(1, 1), (2, 2), (3, 4), (5, 8), (9, 16), (17, 32), (33, 64), (65, 128), (129, 256), (257, 512)]
+    counts = []
+    for lo, hi in buckets:
+        if lo > args.l3_k_max:
+            break
+        counts.append(((lo, min(hi, args.l3_k_max)), int(((alloc_t >= lo) & (alloc_t <= min(hi, args.l3_k_max))).sum())))
+    max_count = max(c for _, c in counts) if counts else 1
+    bar_width = 30
+    print0("L3 embeddings per token distribution:")
+    for (lo, hi), count in counts:
+        label = f"d_t={lo}" if lo == hi else f"d_t={lo}-{hi}"
+        bar = "\u2588" * round(count / max_count * bar_width)
+        print0(f"  {label:>8s} \u2502 {bar:<{bar_width}s} {count:>6,} ({count/vocab_size*100:5.1f}%)")
+
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = round(args.warmup_ratio * num_iterations)
@@ -398,7 +487,8 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    tokens_so_far = total_batch_size * step
+    flops_so_far = num_flops_per_token * tokens_so_far
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -412,10 +502,11 @@ while True:
             min_val_bpb = val_bpb
         wandb_run.log({
             "step": step,
+            "total_training_tokens": tokens_so_far,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -429,10 +520,11 @@ while True:
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
+            "total_training_tokens": tokens_so_far,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
-        })
+        }, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -535,9 +627,10 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    if step % args.log_every == 0:
         log_data = {
             "step": step,
+            "total_training_tokens": tokens_so_far,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
@@ -547,7 +640,10 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
-        wandb_run.log(log_data)
+        # L3 diagnostics (run outside torch.compile)
+        if orig_model.l3_layers:
+            log_data.update(orig_model.l3_diagnostics(x[:1]))
+        wandb_run.log(log_data, step=step)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)

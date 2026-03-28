@@ -7,8 +7,14 @@ import re
 import logging
 import urllib.request
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from filelock import FileLock
+
+
+def norm(x):
+    """Purely functional rmsnorm with no learnable params."""
+    return F.rms_norm(x, (x.size(-1),))
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""

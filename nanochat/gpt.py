@@ -19,11 +19,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.common import get_dist_info, print0
+from nanochat.common import get_dist_info, print0, norm
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
+from nanochat.l3 import L3Layer
 
 @dataclass
 class GPTConfig:
@@ -37,11 +38,17 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-
-
-def norm(x):
-    # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
+    # L3 (Large Lookup Layers) config
+    l3_after_layers: str = ""   # comma-separated layer indices (empty = disabled)
+    l3_n_emb: int = 0           # total embeddings (0 = disabled)
+    l3_d_up: int = 0            # up-projection dim (0 = auto: 4 * n_embd)
+    l3_k_max: int = 32          # max embeddings per token
+    l3_lambda: bool = False     # learnable per-L3-layer scaling (True = learnable, False = unscaled residual)
+    # Looped transformer config
+    n_loops: int = 1            # times to loop through blocks (1 = standard)
+    l3_every_loops: int = 0     # insert L3 every N loop boundaries (0 = disabled, only when n_loops > 1)
+    tbptl: int = 0              # truncated backprop: forward-only for first N loops (0 = disabled)
+    mlp_type: str = "relu2"     # "relu2" (current) or "convswiglu"
 
 
 def has_ve(layer_idx, n_layer):
@@ -108,8 +115,8 @@ class CausalSelfAttention(nn.Module):
                 causal=True,
                 window_size=window_size,
             )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
+            # Advance position after last effective layer processes
+            if self.layer_idx + kv_cache.layer_offset == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
@@ -131,11 +138,52 @@ class MLP(nn.Module):
         return x
 
 
+class SwiGLU(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # 2/3 of 4x expansion for gate+up (roughly same param budget as relu2 MLP)
+        inter = (4 * config.n_embd * 2 // 3 + 255) // 256 * 256  # round to 256 for tensor cores
+        self.inter = inter
+        self.c_gate_up = nn.Linear(config.n_embd, inter * 2, bias=False)  # fused gate + up
+        self.c_proj = nn.Linear(inter, config.n_embd, bias=False)
+
+    def forward(self, x):
+        gate, up = self.c_gate_up(x).chunk(2, dim=-1)
+        x = F.silu(gate) * up
+        x = self.c_proj(x)
+        return x
+
+
+class ConvSwiGLU(nn.Module):
+    def __init__(self, config, conv_kernel=2):
+        super().__init__()
+        # SwiGLU uses 2/3 of 4x expansion for gate+up (roughly same param budget as relu2 MLP)
+        inter = (4 * config.n_embd * 2 // 3 + 255) // 256 * 256  # round to 256 for tensor cores
+        self.inter = inter
+        self.c_gate_up = nn.Linear(config.n_embd, inter * 2, bias=False)  # fused gate + up
+        self.dwconv = nn.Conv1d(inter, inter, kernel_size=conv_kernel,
+                                padding=conv_kernel // 2, groups=inter, bias=True)
+        self.c_proj = nn.Linear(inter, config.n_embd, bias=False)
+
+    def forward(self, x):
+        gate, up = self.c_gate_up(x).chunk(2, dim=-1)
+        x = F.silu(gate) * up
+        x = self.dwconv(x.transpose(1, 2).to(self.dwconv.weight.dtype))
+        x = x[..., :gate.size(1)]  # trim conv padding
+        x = F.silu(x)
+        x = x.transpose(1, 2).contiguous()
+        x = self.c_proj(x)
+        return x
+
+
+_MLP_TYPES = {"relu2": MLP, "swiglu": SwiGLU, "convswiglu": ConvSwiGLU}
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = _MLP_TYPES[config.mlp_type](config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -175,6 +223,37 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # L3 layers (placed between decoder blocks, or at loop boundaries when looping)
+        l3_d_up = config.l3_d_up if config.l3_d_up > 0 else 4 * config.n_embd
+        if config.n_loops > 1:
+            # Looped mode: L3 at loop boundaries (mutually exclusive with l3_after_layers)
+            assert not config.l3_after_layers, "l3_after_layers and n_loops>1 are mutually exclusive"
+            self.l3_layer_indices = set()  # not used in looped mode
+            self._l3_loop_indices = [loop for loop in range(1, config.n_loops)
+                                     if config.l3_every_loops > 0 and (loop - 1) % config.l3_every_loops == 0]
+            if config.l3_d_up == 0 and self._l3_loop_indices and config.l3_n_emb > 0:
+                config.l3_d_up = l3_d_up
+            self.l3_layers = nn.ModuleDict({
+                str(loop): L3Layer(config.n_embd, config.l3_n_emb, l3_d_up,
+                                   vocab_size=config.vocab_size, k_max=config.l3_k_max)
+                for loop in self._l3_loop_indices
+            }) if self._l3_loop_indices and config.l3_n_emb > 0 else nn.ModuleDict()
+            sorted_l3 = sorted(self._l3_loop_indices) if self._l3_loop_indices else []
+        else:
+            # Standard mode: L3 after specific layer indices
+            self.l3_layer_indices = set(int(x) for x in config.l3_after_layers.split(",") if x.strip()) if config.l3_after_layers else set()
+            self._l3_loop_indices = []
+            if config.l3_d_up == 0 and self.l3_layer_indices:
+                config.l3_d_up = l3_d_up
+            self.l3_layers = nn.ModuleDict({
+                str(i): L3Layer(config.n_embd, config.l3_n_emb, l3_d_up,
+                                vocab_size=config.vocab_size, k_max=config.l3_k_max)
+                for i in self.l3_layer_indices
+            }) if self.l3_layer_indices and config.l3_n_emb > 0 else nn.ModuleDict()
+            sorted_l3 = sorted(self.l3_layer_indices) if self.l3_layer_indices else []
+        # L3 per-layer learnable scaling (like resid_lambdas for the residual stream)
+        self._l3_lambda_map = {i: pos for pos, i in enumerate(sorted_l3)}
+        self.l3_lambdas = nn.Parameter(torch.ones(len(sorted_l3))) if (sorted_l3 and config.l3_lambda) else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -213,8 +292,17 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if isinstance(block.mlp, ConvSwiGLU):
+                torch.nn.init.uniform_(block.mlp.c_gate_up.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+                torch.nn.init.zeros_(block.mlp.dwconv.bias)
+                # dwconv.weight: leave at default init (Kaiming uniform, fine for small depthwise kernel)
+            elif isinstance(block.mlp, SwiGLU):
+                torch.nn.init.uniform_(block.mlp.c_gate_up.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -229,6 +317,17 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
+        # L3 layers: kv_weight uses Llama-style init (std=1/sqrt(n_embd)) so that
+        # attention logits have O(1) variance at init, giving smooth softmax.
+        # std=1.0 would give logits with std≈sqrt(n_embd)≈28, making softmax one-hot.
+        l3_std = n_embd ** -0.5
+        for l3_layer in self.l3_layers.values():
+            torch.nn.init.normal_(l3_layer.kv_weight, mean=0.0, std=l3_std)
+            torch.nn.init.uniform_(l3_layer.w_up.weight, -s, s)
+            torch.nn.init.zeros_(l3_layer.w_mix.weight)  # Zero init (consistent with c_proj pattern)
+        if self.l3_lambdas is not None:
+            self.l3_lambdas.fill_(1.0)
+
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -239,6 +338,8 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
+            for l3_layer in self.l3_layers.values():
+                l3_layer.kv_weight.data = l3_layer.kv_weight.data.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -289,6 +390,12 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def _l3_scale(self, key):
+        """Return the learnable L3 scale for the given layer/loop key, or 1 if disabled."""
+        if self.l3_lambdas is not None:
+            return self.l3_lambdas[self._l3_lambda_map[key]]
+        return 1
+
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -304,16 +411,36 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+        # L3 kv/k/v weights are embeddings (lookup tables), not matmul weights
+        l3_embed_numel = 0
+        l3_matrix_numel = 0
+        for l3_layer in self.l3_layers.values():
+            l3_embed_numel += l3_layer.kv_weight.numel()
+            l3_matrix_numel += l3_layer.w_up.weight.numel() + l3_layer.w_mix.weight.numel()
+        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel + l3_embed_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
+        n_loops = self.config.n_loops
         # Sum attention FLOPs per layer, accounting for sliding window
-        attn_flops = 0
+        attn_flops_per_pass = 0
         for window_size in self.window_sizes:
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+            attn_flops_per_pass += 12 * h * q * effective_seq
+        # L3 FLOPs: only the attention-like compute (K_t@x and V_t@score).
+        # W_up and W_mix are already counted in matmul params below.
+        # Forward: 2*avg_k*n_embd (K@x) + 2*avg_k*n_embd (V@score) = 4*avg_k*n_embd
+        # Fwd+bwd: 3x forward = 12*avg_k*n_embd
+        l3_flops = 0
+        if self.l3_layers:
+            n_embd = self.config.n_embd
+            avg_k = self.config.l3_n_emb / self.config.vocab_size if self.config.vocab_size > 0 else 1
+            per_l3 = 12 * avg_k * n_embd
+            l3_flops = int(per_l3 * len(self.l3_layers))
+        # With looping, shared block params are used n_loops times per forward pass
+        block_params = sum(p.numel() for p in self.transformer.h.parameters())
+        other_matmul_params = (nparams - nparams_exclude) - block_params  # lm_head + l3 matrices
+        num_flops_per_token = 6 * (n_loops * block_params + other_matmul_params) + n_loops * attn_flops_per_pass + l3_flops
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -333,30 +460,52 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + (self.l3_lambdas.numel() if self.l3_lambdas is not None else 0)
+        # L3: separate embedding-like params from matrix params
+        l3_embeds = 0
+        l3_matrices = 0
+        for l3_layer in self.l3_layers.values():
+            l3_embeds += l3_layer.kv_weight.numel()
+            l3_matrices += l3_layer.w_up.weight.numel() + l3_layer.w_mix.weight.numel()
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + l3_embeds + l3_matrices
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
-        return {
+        result = {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'l3_embeds': l3_embeds,
+            'l3_matrices': l3_matrices,
             'scalars': scalars,
             'total': total,
         }
+        if self.config.n_loops > 1:
+            result['n_loops'] = self.config.n_loops
+        return result
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Split block params by dimensionality: 2D matrices go to Muon, everything else (1D biases,
+        # 3D conv weights) goes to AdamW. Muon is designed for 2D weight matrices only.
+        matrix_params = [p for p in self.transformer.h.parameters() if p.dim() == 2]
+        block_scalar_params = [p for p in self.transformer.h.parameters() if p.dim() != 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        # L3 params: embedding-like (kv weights), matrix (w_up, w_mix), and scalars (l3_lambdas)
+        l3_embed_params = []
+        l3_matrix_params = []
+        l3_scalar_params = [self.l3_lambdas] if self.l3_lambdas is not None else []
+        for l3_layer in self.l3_layers.values():
+            l3_embed_params.append(l3_layer.kv_weight)
+            l3_matrix_params.append(l3_layer.w_up.weight)
+            l3_matrix_params.append(l3_layer.w_mix.weight)
+        assert len(list(self.parameters())) == len(matrix_params) + len(block_scalar_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params) + len(l3_scalar_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -371,9 +520,19 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        # Block bias params (e.g. ConvSwiGLU depthwise conv bias) - empty when mlp_type="relu2"
+        if block_scalar_params:
+            param_groups.append(dict(kind='adamw', params=block_scalar_params, lr=scalar_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+        # L3 scalar params (like x0_lambdas: learned gating)
+        if l3_scalar_params:
+            param_groups.append(dict(kind='adamw', params=l3_scalar_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
+        # L3 param groups: kv_weight uses AdamW (like token embeddings, no weight decay)
+        if l3_embed_params:
+            param_groups.append(dict(kind='adamw', params=l3_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        all_matrix_params = matrix_params + l3_matrix_params
+        for shape in sorted({p.shape for p in all_matrix_params}):
+            group_params = [p for p in all_matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
@@ -400,10 +559,43 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+        if self.config.n_loops > 1:
+            # Looped forward pass: shared blocks executed n_loops times
+            # TBPTL: first tbptl loops run under no_grad (no autograd graph, saves memory)
+            n_layer = self.config.n_layer
+            tbptl = self.config.tbptl if self.training else 0
+            if tbptl > 0:
+                with torch.no_grad():
+                    for loop in range(tbptl):
+                        l3_key = str(loop)
+                        if loop > 0 and l3_key in self.l3_layers:
+                            x = x + self._l3_scale(loop) * self.l3_layers[l3_key](x, idx)
+                        if kv_cache is not None:
+                            kv_cache.layer_offset = loop * n_layer
+                        for i, block in enumerate(self.transformer.h):
+                            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            # Trainable loops (tbptl onward): full gradient tracking
+            for loop in range(tbptl, self.config.n_loops):
+                l3_key = str(loop)
+                if loop > 0 and l3_key in self.l3_layers:
+                    x = x + self._l3_scale(loop) * self.l3_layers[l3_key](x, idx)
+                if kv_cache is not None:
+                    kv_cache.layer_offset = loop * n_layer
+                for i, block in enumerate(self.transformer.h):
+                    x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                    ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                    x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+        else:
+            # Standard (non-looped) forward pass
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+                # L3 layer after this block (if configured)
+                if str(i) in self.l3_layers:
+                    x = x + self._l3_scale(i) * self.l3_layers[str(i)](x, idx)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -421,6 +613,58 @@ class GPT(nn.Module):
         else:
             # inference: just return the logits directly
             return logits
+
+    @torch.no_grad()
+    def l3_diagnostics(self, idx):
+        """Compute L3 diagnostic metrics outside of torch.compile. Returns flat dict with l3/ prefix keys."""
+        if not self.l3_layers:
+            return {}
+        B, T = idx.size()
+        T0 = 0
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        x0 = x
+        metrics = {}
+        if self.config.n_loops > 1:
+            # Looped mode: L3 at loop boundaries
+            for loop in range(self.config.n_loops):
+                l3_key = str(loop)
+                if loop > 0 and l3_key in self.l3_layers:
+                    delta, diag = self.l3_layers[l3_key].diagnostics(x, idx)
+                    scaled_delta = self._l3_scale(loop) * delta
+                    key = f"loop{loop}"
+                    metrics[f"l3/delta_ratio_{key}"] = (scaled_delta.norm() / (x.norm() + 1e-8)).item()
+                    for dname, dval in diag.items():
+                        metrics[f"l3/{dname}_{key}"] = dval
+                    x = x + scaled_delta
+                for i, block in enumerate(self.transformer.h):
+                    x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                    ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                    x = block(x, ve, cos_sin, self.window_sizes[i], None)
+        else:
+            # Standard mode: L3 after specific layers
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], None)
+                if str(i) in self.l3_layers:
+                    delta, diag = self.l3_layers[str(i)].diagnostics(x, idx)
+                    scaled_delta = self._l3_scale(i) * delta
+                    key = f"layer{i}"
+                    metrics[f"l3/delta_ratio_{key}"] = (scaled_delta.norm() / (x.norm() + 1e-8)).item()
+                    for dname, dval in diag.items():
+                        metrics[f"l3/{dname}_{key}"] = dval
+                    x = x + scaled_delta
+        # Weight norms (w_up, w_mix only — kv_weight is F.normalized at forward time so raw norm is meaningless)
+        for key, l3_layer in self.l3_layers.items():
+            metrics[f"l3/w_up_norm_{key}"] = l3_layer.w_up.weight.norm().item()
+            metrics[f"l3/w_mix_norm_{key}"] = l3_layer.w_mix.weight.norm().item()
+        # Lambda values
+        if self.l3_lambdas is not None:
+            for key, pos in self._l3_lambda_map.items():
+                metrics[f"l3/lambda_{key}"] = self.l3_lambdas[pos].item()
+        return metrics
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

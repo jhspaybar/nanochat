@@ -96,6 +96,7 @@ class KVCache:
         self.n_layers = num_layers
         self.n_heads = num_heads
         self.head_dim = head_dim
+        self.layer_offset = 0  # set by looped forward pass to loop * n_physical_layers
         # Pre-allocate cache tensors: (n_layers, B, T, H, D)
         self.k_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
         self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
@@ -111,8 +112,9 @@ class KVCache:
         return self.cache_seqlens[0].item()
 
     def get_layer_cache(self, layer_idx):
-        """Return (k_cache, v_cache) views for a specific layer."""
-        return self.k_cache[layer_idx], self.v_cache[layer_idx]
+        """Return (k_cache, v_cache) views for a specific layer (offset by layer_offset for looped models)."""
+        idx = layer_idx + self.layer_offset
+        return self.k_cache[idx], self.v_cache[idx]
 
     def advance(self, num_tokens):
         """Advance the cache position by num_tokens."""
@@ -193,7 +195,7 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer * m.n_loops}
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),

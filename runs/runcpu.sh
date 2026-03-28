@@ -41,7 +41,8 @@ python -m scripts.base_train \
     --core-metric-every=-1 \
     --sample-every=100 \
     --num-iterations=5000 \
-    --run=$WANDB_RUN
+    --run=$WANDB_RUN \
+    $EXTRA_ARGS
 python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16
 
 # SFT (~10 minutes on my MacBook Pro M3 Max)
