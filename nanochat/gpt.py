@@ -49,6 +49,9 @@ class GPTConfig:
     l3_every_loops: int = 0     # insert L3 every N loop boundaries (0 = disabled, only when n_loops > 1)
     tbptl: int = 0              # truncated backprop: forward-only for first N loops (0 = disabled)
     mlp_type: str = "relu2"     # "relu2" (current) or "convswiglu"
+    # Mixture-of-Depths (MoD): route only top-k% of tokens through block per layer
+    mod_budget: float = 0.0     # 0.0 = disabled, e.g. 0.5 = 50% of tokens routed through block
+    mod_layers: str = ""        # comma-separated layer indices for MoD (empty = every-other starting at 1)
 
 
 def has_ve(layer_idx, n_layer):
@@ -180,15 +183,57 @@ _MLP_TYPES = {"relu2": MLP, "swiglu": SwiGLU, "convswiglu": ConvSwiGLU}
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, mod_enabled=False):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = _MLP_TYPES[config.mlp_type](config)
+        # Mixture-of-Depths: router gates full block (attn + MLP), matching Raposo et al. 2024
+        self.mod_enabled = mod_enabled
+        if mod_enabled:
+            self.mod_router = nn.Linear(config.n_embd, 1, bias=False)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, mod_budget=0.0):
+        if self.mod_enabled and 0 < mod_budget < 1 and x.size(1) > 1:
+            B, T, C = x.size()
+            # Router scores on pre-norm input (before block)
+            router_logits = self.mod_router(norm(x)).squeeze(-1)  # (B, T)
+            k = max(1, int(T * mod_budget))
+            _, top_k_idx = torch.topk(router_logits, k, dim=-1, sorted=False)  # (B, k)
+            top_k_idx, _ = torch.sort(top_k_idx, dim=-1)  # preserve causal ordering
+            router_weights = torch.sigmoid(torch.gather(router_logits, 1, top_k_idx))  # (B, k)
+
+            # Gather selected tokens
+            idx_c = top_k_idx.unsqueeze(-1).expand(-1, -1, C)  # (B, k, C)
+            x_sel = torch.gather(x, 1, idx_c)  # (B, k, C)
+
+            # Gather value embeddings at selected positions
+            ve_sel = None
+            if ve is not None:
+                ve_sel = torch.gather(ve, 1, top_k_idx.unsqueeze(-1).expand(-1, -1, ve.size(-1)))
+
+            # Gather rotary embeddings at original positions (preserves positional info)
+            cos, sin = cos_sin
+            hd = cos.size(-1)
+            pos_idx = top_k_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, hd)  # (B, k, 1, hd)
+            cos_sel = cos.expand(B, -1, -1, -1).gather(1, pos_idx)  # (B, k, 1, hd)
+            sin_sel = sin.expand(B, -1, -1, -1).gather(1, pos_idx)
+
+            # Run full block (attn + MLP) on selected tokens only
+            x_sel_out = x_sel + self.attn(norm(x_sel), ve_sel, (cos_sel, sin_sel), window_size, kv_cache)
+            x_sel_out = x_sel_out + self.mlp(norm(x_sel_out))
+
+            # Weighted delta, scatter back (non-selected tokens get pure residual)
+            delta = (x_sel_out - x_sel) * router_weights.unsqueeze(-1)
+            update = torch.zeros_like(x)
+            update.scatter_(1, idx_c, delta)
+            return x + update
+        else:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+            x = x + self.mlp(norm(x))
+            # During warmup (budget>=1): run router for gradient, zero contribution to output
+            if self.mod_enabled and x.size(1) > 1:
+                x = x + 0.0 * self.mod_router(norm(x)).sum()
+            return x
 
 
 class GPT(nn.Module):
@@ -208,9 +253,21 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        # Compute which layers get MoD routing
+        if 0 < config.mod_budget < 1:
+            if config.mod_layers:
+                self.mod_layer_set = set(int(x) for x in config.mod_layers.split(",") if x.strip())
+            else:
+                # Default: every-other layer starting at 1 (matching Raposo et al. 2024 best config)
+                self.mod_layer_set = set(range(1, config.n_layer, 2))
+            if self.mod_layer_set:
+                print0(f"MoD enabled on layers: {sorted(self.mod_layer_set)} (budget={config.mod_budget})")
+        else:
+            self.mod_layer_set = set()
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, mod_enabled=(layer_idx in self.mod_layer_set))
+                                for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -316,6 +373,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+            # MoD router: zero init so sigmoid(0)=0.5 for all tokens (uniform routing at start)
+            if hasattr(block, 'mod_router'):
+                torch.nn.init.zeros_(block.mod_router.weight)
 
         # L3 layers: kv_weight uses Llama-style init (std=1/sqrt(n_embd)) so that
         # attention logits have O(1) variance at init, giving smooth softmax.
@@ -438,9 +498,21 @@ class GPT(nn.Module):
             per_l3 = 12 * avg_k * n_embd
             l3_flops = int(per_l3 * len(self.l3_layers))
         # With looping, shared block params are used n_loops times per forward pass
-        block_params = sum(p.numel() for p in self.transformer.h.parameters())
-        other_matmul_params = (nparams - nparams_exclude) - block_params  # lm_head + l3 matrices
-        num_flops_per_token = 6 * (n_loops * block_params + other_matmul_params) + n_loops * attn_flops_per_pass + l3_flops
+        # MoD: only MoD-enabled layers skip tokens; others run at full capacity
+        mod_budget = self.config.mod_budget
+        block_flops = 0
+        attn_flops_total = 0
+        block_params_total = 0
+        for i, block in enumerate(self.transformer.h):
+            bp = sum(p.numel() for p in block.parameters())
+            block_params_total += bp
+            scale = mod_budget if block.mod_enabled and 0 < mod_budget < 1 else 1.0
+            block_flops += 6 * n_loops * scale * bp
+            window = self.window_sizes[i][0]
+            effective_seq = t if window < 0 else min(window, t)
+            attn_flops_total += n_loops * scale * 12 * h * q * effective_seq
+        other_matmul_params = (nparams - nparams_exclude) - block_params_total  # lm_head + l3 matrices
+        num_flops_per_token = block_flops + 6 * other_matmul_params + attn_flops_total + l3_flops
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -490,7 +562,12 @@ class GPT(nn.Module):
         # Separate out all parameters into groups
         # Split block params by dimensionality: 2D matrices go to Muon, everything else (1D biases,
         # 3D conv weights) goes to AdamW. Muon is designed for 2D weight matrices only.
-        matrix_params = [p for p in self.transformer.h.parameters() if p.dim() == 2]
+        # Collect MoD router params separately (tiny 1×n_embd projections, not suited for Muon)
+        mod_router_params = set()
+        for block in self.transformer.h:
+            if hasattr(block, 'mod_router'):
+                mod_router_params.update(block.mod_router.parameters())
+        matrix_params = [p for p in self.transformer.h.parameters() if p.dim() == 2 and p not in mod_router_params]
         block_scalar_params = [p for p in self.transformer.h.parameters() if p.dim() != 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
@@ -505,7 +582,8 @@ class GPT(nn.Module):
             l3_embed_params.append(l3_layer.kv_weight)
             l3_matrix_params.append(l3_layer.w_up.weight)
             l3_matrix_params.append(l3_layer.w_mix.weight)
-        assert len(list(self.parameters())) == len(matrix_params) + len(block_scalar_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params) + len(l3_scalar_params)
+        mod_router_params = list(mod_router_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(block_scalar_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params) + len(l3_scalar_params) + len(mod_router_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -523,6 +601,9 @@ class GPT(nn.Module):
         # Block bias params (e.g. ConvSwiGLU depthwise conv bias) - empty when mlp_type="relu2"
         if block_scalar_params:
             param_groups.append(dict(kind='adamw', params=block_scalar_params, lr=scalar_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+        # MoD router params: small learned projections, use AdamW like other scalar/gating params
+        if mod_router_params:
+            param_groups.append(dict(kind='adamw', params=mod_router_params, lr=scalar_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # L3 scalar params (like x0_lambdas: learned gating)
         if l3_scalar_params:
             param_groups.append(dict(kind='adamw', params=l3_scalar_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
@@ -544,8 +625,10 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', mod_budget=None):
         B, T = idx.size()
+        # MoD budget: use provided value (for warmup), or fall back to config default
+        _mod_budget = mod_budget if mod_budget is not None else self.config.mod_budget
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -575,7 +658,7 @@ class GPT(nn.Module):
                         for i, block in enumerate(self.transformer.h):
                             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-                            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+                            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mod_budget=_mod_budget)
             # Trainable loops (tbptl onward): full gradient tracking
             for loop in range(tbptl, self.config.n_loops):
                 l3_key = str(loop)
@@ -586,13 +669,13 @@ class GPT(nn.Module):
                 for i, block in enumerate(self.transformer.h):
                     x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                     ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-                    x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+                    x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mod_budget=_mod_budget)
         else:
             # Standard (non-looped) forward pass
             for i, block in enumerate(self.transformer.h):
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                 ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mod_budget=_mod_budget)
                 # L3 layer after this block (if configured)
                 if str(i) in self.l3_layers:
                     x = x + self._l3_scale(i) * self.l3_layers[str(i)](x, idx)
@@ -664,6 +747,45 @@ class GPT(nn.Module):
         if self.l3_lambdas is not None:
             for key, pos in self._l3_lambda_map.items():
                 metrics[f"l3/lambda_{key}"] = self.l3_lambdas[pos].item()
+        return metrics
+
+    @torch.no_grad()
+    def mod_diagnostics(self, idx):
+        """Compute MoD diagnostic metrics outside of torch.compile. Returns flat dict with mod/ prefix keys."""
+        if not (0 < self.config.mod_budget < 1):
+            return {}
+        B, T = idx.size()
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        x0 = x
+        metrics = {}
+        def _log_router(block, layer_key, x_in):
+            logits = block.mod_router(norm(x_in)).squeeze(-1)  # (B, T)
+            metrics[f"mod/router_mean_{layer_key}"] = logits.mean().item()
+            metrics[f"mod/router_std_{layer_key}"] = logits.std().item()
+            metrics[f"mod/router_wnorm_{layer_key}"] = block.mod_router.weight.norm().item()
+
+        if self.config.n_loops > 1:
+            for loop in range(self.config.n_loops):
+                l3_key = str(loop)
+                if loop > 0 and l3_key in self.l3_layers:
+                    x = x + self._l3_scale(loop) * self.l3_layers[l3_key](x, idx)
+                for i, block in enumerate(self.transformer.h):
+                    x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                    ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                    if block.mod_enabled:
+                        _log_router(block, f"loop{loop}_layer{i}", x)
+                    x = block(x, ve, cos_sin, self.window_sizes[i], None, mod_budget=self.config.mod_budget)
+        else:
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                if block.mod_enabled:
+                    _log_router(block, f"layer{i}", x)
+                x = block(x, ve, cos_sin, self.window_sizes[i], None, mod_budget=self.config.mod_budget)
+                if str(i) in self.l3_layers:
+                    x = x + self._l3_scale(i) * self.l3_layers[str(i)](x, idx)
         return metrics
 
     @torch.inference_mode()

@@ -65,6 +65,10 @@ parser.add_argument("--tbptl", type=int, default=0, help="Truncated backprop: fo
 # MLP type
 parser.add_argument("--mlp", type=str, default="relu2", choices=["relu2", "swiglu", "convswiglu"],
                     help="MLP type: relu2 (default), swiglu (gated SiLU), or convswiglu (SwiGLU + depthwise conv)")
+# Mixture-of-Depths (MoD)
+parser.add_argument("--mod-budget", type=float, default=0.0, help="MoD: fraction of tokens routed through block (0.0=disabled, e.g. 0.125=12.5%%)")
+parser.add_argument("--mod-layers", type=str, default="", help="comma-separated layer indices for MoD (empty=every-other starting at 1)")
+parser.add_argument("--mod-warmup-ratio", type=float, default=0.0, help="fraction of training to warmup MoD budget from 1.0 to target (0.0=no warmup)")
 # MPS acceleration
 parser.add_argument("--mps-flash", action="store_true", help="enable Metal Flash Attention on MPS (requires metal-flash-sdpa)")
 # Training horizon (only one used, in order of precedence)
@@ -149,7 +153,7 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_loops=1, tbptl=0, mlp_type="relu2"):
+def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_loops=1, tbptl=0, mlp_type="relu2", mod_budget=0.0, mod_layers=""):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
@@ -169,6 +173,8 @@ def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_
         l3_every_loops=l3_every_loops,
         tbptl=tbptl,
         mlp_type=mlp_type,
+        mod_budget=mod_budget,
+        mod_layers=mod_layers,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -187,7 +193,8 @@ if args.l3_after_layers or (args.loops > 1 and args.l3_every_loops > 0):
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=l3_n_emb,
                          n_loops=args.loops, l3_every_loops=args.l3_every_loops, tbptl=args.tbptl,
-                         mlp_type=args.mlp) # 1) Build on meta device (only shapes/dtypes, no data)
+                         mlp_type=args.mlp, mod_budget=args.mod_budget,
+                         mod_layers=args.mod_layers) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
@@ -457,6 +464,16 @@ def get_muon_momentum(it):
 def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
+# MoD budget warmup: full capacity during warmup, then snap to target budget.
+# Step function avoids torch.compile recompilations from changing tensor shapes.
+def get_mod_budget(it):
+    if not (0 < args.mod_budget < 1):
+        return 0.0  # disabled
+    warmup_iters = round(args.mod_warmup_ratio * num_iterations)
+    if warmup_iters > 0 and it < warmup_iters:
+        return 1.0  # full capacity during warmup
+    return args.mod_budget
+
 # -----------------------------------------------------------------------------
 # Training loop
 
@@ -582,9 +599,10 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    mod_budget = get_mod_budget(step)
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x, y, mod_budget=mod_budget)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
@@ -640,9 +658,14 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if 0 < args.mod_budget < 1:
+            log_data["mod/budget"] = mod_budget
         # L3 diagnostics (run outside torch.compile)
         if orig_model.l3_layers:
             log_data.update(orig_model.l3_diagnostics(x[:1]))
+        # MoD diagnostics (run outside torch.compile)
+        if 0 < args.mod_budget < 1:
+            log_data.update(orig_model.mod_diagnostics(x[:1]))
         wandb_run.log(log_data, step=step)
 
     # state update
