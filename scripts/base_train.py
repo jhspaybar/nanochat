@@ -69,6 +69,8 @@ parser.add_argument("--mlp", type=str, default="relu2", choices=["relu2", "swigl
 parser.add_argument("--mod-budget", type=float, default=0.0, help="MoD: fraction of tokens routed through block (0.0=disabled, e.g. 0.125=12.5%%)")
 parser.add_argument("--mod-layers", type=str, default="", help="comma-separated layer indices for MoD (empty=every-other starting at 1)")
 parser.add_argument("--mod-warmup-ratio", type=float, default=0.0, help="fraction of training to warmup MoD budget from 1.0 to target (0.0=no warmup)")
+# Manifold-Constrained Hyper-Connections (mHC)
+parser.add_argument("--hc-streams", type=int, default=1, help="mHC: number of parallel residual streams (1=disabled, 2+=enabled with Sinkhorn mixing)")
 # MPS acceleration
 parser.add_argument("--mps-flash", action="store_true", help="enable Metal Flash Attention on MPS (requires metal-flash-sdpa)")
 # Training horizon (only one used, in order of precedence)
@@ -153,7 +155,7 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_loops=1, tbptl=0, mlp_type="relu2", mod_budget=0.0, mod_layers=""):
+def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_loops=1, tbptl=0, mlp_type="relu2", mod_budget=0.0, mod_layers="", hc_n_streams=1):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
@@ -175,6 +177,7 @@ def build_model_meta(depth, l3_after_layers="", l3_n_emb=0, n_loops=1, l3_every_
         mlp_type=mlp_type,
         mod_budget=mod_budget,
         mod_layers=mod_layers,
+        hc_n_streams=hc_n_streams,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -194,7 +197,7 @@ if args.l3_after_layers or (args.loops > 1 and args.l3_every_loops > 0):
 model = build_model_meta(args.depth, l3_after_layers=args.l3_after_layers, l3_n_emb=l3_n_emb,
                          n_loops=args.loops, l3_every_loops=args.l3_every_loops, tbptl=args.tbptl,
                          mlp_type=args.mlp, mod_budget=args.mod_budget,
-                         mod_layers=args.mod_layers) # 1) Build on meta device (only shapes/dtypes, no data)
+                         mod_layers=args.mod_layers, hc_n_streams=args.hc_streams) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
@@ -512,6 +515,7 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        orig_model.precompute_hc()  # pre-compute Sinkhorn matrices outside torch.compile
         with disable_fp8(model), autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
@@ -600,6 +604,7 @@ while True:
     synchronize()
     t0 = time.time()
     mod_budget = get_mod_budget(step)
+    orig_model.precompute_hc()  # pre-compute Sinkhorn matrices outside torch.compile
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y, mod_budget=mod_budget)
@@ -666,6 +671,9 @@ while True:
         # MoD diagnostics (run outside torch.compile)
         if 0 < args.mod_budget < 1:
             log_data.update(orig_model.mod_diagnostics(x[:1]))
+        # mHC diagnostics
+        if args.hc_streams > 1:
+            log_data.update(orig_model.hc_diagnostics())
         wandb_run.log(log_data, step=step)
 
     # state update

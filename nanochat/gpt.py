@@ -50,8 +50,10 @@ class GPTConfig:
     tbptl: int = 0              # truncated backprop: forward-only for first N loops (0 = disabled)
     mlp_type: str = "relu2"     # "relu2" (current) or "convswiglu"
     # Mixture-of-Depths (MoD): route only top-k% of tokens through block per layer
-    mod_budget: float = 0.0     # 0.0 = disabled, e.g. 0.5 = 50% of tokens routed through block
+    mod_budget: float = 0.0     # 0.0 = disabled, e.g. 0.125 = 12.5% of tokens routed through block
     mod_layers: str = ""        # comma-separated layer indices for MoD (empty = every-other starting at 1)
+    # Manifold-Constrained Hyper-Connections (mHC): multi-stream residual with doubly stochastic mixing
+    hc_n_streams: int = 1       # 1 = standard single residual stream, 2+ = parallel streams with mHC
 
 
 def has_ve(layer_idx, n_layer):
@@ -65,6 +67,77 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+@torch.compiler.disable
+def sinkhorn_log(logits, n_iters=10, tau=0.05):
+    """Log-space Sinkhorn-Knopp projection onto the Birkhoff polytope.
+    Uses temperature τ to control sharpness — smaller τ = sharper distribution.
+    Log-space avoids numerical underflow for large matrices.
+    Decorated with @torch.compiler.disable to prevent unrolling the loop into
+    a single kernel (MPS Metal has a 31 constant buffer limit per shader)."""
+    n = logits.shape[0]
+    log_n = torch.tensor(n, dtype=logits.dtype, device=logits.device).log()
+    Z = logits / tau  # temperature scaling
+    u = torch.zeros(n, dtype=logits.dtype, device=logits.device)
+    v = torch.zeros(n, dtype=logits.dtype, device=logits.device)
+    for _ in range(n_iters):
+        u = log_n - torch.logsumexp(Z + v.unsqueeze(0), dim=1)
+        v = log_n - torch.logsumexp(Z + u.unsqueeze(1), dim=0)
+    return torch.exp(Z + u.unsqueeze(1) + v.unsqueeze(0)) / n
+
+
+class HyperConnection(nn.Module):
+    """Manifold-Constrained Hyper-Connection (mHC) layer.
+
+    Implements: output_streams = H_res @ input_streams + H_post * F(H_pre @ input_streams)
+
+    Three static learnable matrices per layer:
+      H_pre  (n,):    aggregates n streams into block input (softmax → convex combination)
+      H_post (n,):    distributes block output across all streams (softmax → convex combination)
+      H_res  (n, n):  mixes residual streams (Sinkhorn → doubly stochastic)
+    """
+    def __init__(self, n_streams):
+        super().__init__()
+        self.n_streams = n_streams
+        self.pre_logits = nn.Parameter(torch.zeros(n_streams))
+        self.post_logits = nn.Parameter(torch.zeros(n_streams))
+        self.res_logits = nn.Parameter(torch.zeros(n_streams, n_streams))
+
+    def init_weights(self):
+        """Initialize so HC reduces to standard Pre-Norm residual at init."""
+        # H_pre: stream 0 gets all weight
+        self.pre_logits.data.fill_(-8.0)
+        self.pre_logits.data[0] = 0.0
+        # H_post: uniform distribution (all streams get equal share of block output)
+        self.post_logits.data.fill_(0.0)
+        # H_res: identity-biased doubly stochastic
+        self.res_logits.data.fill_(-8.0)
+        for s in range(self.n_streams):
+            self.res_logits.data[s, s] = 0.0
+
+    def forward(self, streams, block_delta, H_res):
+        """
+        Apply HC update: new_streams = H_res @ streams + H_post * block_delta
+
+        Args:
+            streams: (B, T, n_streams, D) — current stream states
+            block_delta: (B, T, D) — block output minus block input (pure transformation)
+            H_res: (n_streams, n_streams) — pre-computed doubly stochastic matrix
+        Returns:
+            new_streams: (B, T, n_streams, D)
+        """
+        new_streams = torch.einsum('ij,BTjD->BTiD', H_res, streams)
+
+        # H_post: distribute block delta to all streams (softmax → convex combination)
+        H_post = F.softmax(self.post_logits, dim=0)  # (n_streams,)
+        new_streams = new_streams + block_delta.unsqueeze(2) * H_post[None, None, :, None]
+        return new_streams
+
+    def aggregate(self, streams):
+        """Aggregate streams into a single block input via H_pre."""
+        H_pre = F.softmax(self.pre_logits, dim=0)  # (n_streams,) convex combination
+        return torch.einsum('s,BTsD->BTD', H_pre, streams)
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -276,6 +349,13 @@ class GPT(nn.Module):
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        # Hyper-Connections (mHC): per-layer multi-stream residual with Sinkhorn mixing
+        if config.hc_n_streams > 1:
+            n_s = config.hc_n_streams
+            self.hc_layers = nn.ModuleList([HyperConnection(n_s) for _ in range(config.n_layer)])
+            print0(f"mHC enabled: {n_s} parallel residual streams with Sinkhorn-constrained mixing")
+        else:
+            self.hc_layers = None
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -311,6 +391,13 @@ class GPT(nn.Module):
         # L3 per-layer learnable scaling (like resid_lambdas for the residual stream)
         self._l3_lambda_map = {i: pos for pos, i in enumerate(sorted_l3)}
         self.l3_lambdas = nn.Parameter(torch.ones(len(sorted_l3))) if (sorted_l3 and config.l3_lambda) else None
+        # HC layers for L3 positions (so L3 delta participates in multi-stream mixing)
+        if config.hc_n_streams > 1 and self.l3_layers:
+            self.hc_l3_layers = nn.ModuleDict({
+                k: HyperConnection(config.hc_n_streams) for k in self.l3_layers.keys()
+            })
+        else:
+            self.hc_l3_layers = None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -364,6 +451,14 @@ class GPT(nn.Module):
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
         self.x0_lambdas.fill_(0.1)      # 0.1 => small initial weight for skip connection to input embedding
+
+        # Hyper-Connections: init so HC reduces to standard residual at init
+        if self.hc_layers is not None:
+            for hc in self.hc_layers:
+                hc.init_weights()
+        if self.hc_l3_layers is not None:
+            for hc in self.hc_l3_layers.values():
+                hc.init_weights()
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
@@ -533,13 +628,16 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + (self.l3_lambdas.numel() if self.l3_lambdas is not None else 0)
+        hc_scalars = sum(p.numel() for p in self.hc_layers.parameters()) if self.hc_layers is not None else 0
+        if self.hc_l3_layers is not None:
+            hc_scalars += sum(p.numel() for p in self.hc_l3_layers.parameters())
         # L3: separate embedding-like params from matrix params
         l3_embeds = 0
         l3_matrices = 0
         for l3_layer in self.l3_layers.values():
             l3_embeds += l3_layer.kv_weight.numel()
             l3_matrices += l3_layer.w_up.weight.numel() + l3_layer.w_mix.weight.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars + l3_embeds + l3_matrices
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + hc_scalars + l3_embeds + l3_matrices
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         result = {
             'wte': wte,
@@ -548,7 +646,7 @@ class GPT(nn.Module):
             'transformer_matrices': transformer_matrices,
             'l3_embeds': l3_embeds,
             'l3_matrices': l3_matrices,
-            'scalars': scalars,
+            'scalars': scalars + hc_scalars,
             'total': total,
         }
         if self.config.n_loops > 1:
@@ -583,7 +681,10 @@ class GPT(nn.Module):
             l3_matrix_params.append(l3_layer.w_up.weight)
             l3_matrix_params.append(l3_layer.w_mix.weight)
         mod_router_params = list(mod_router_params)
-        assert len(list(self.parameters())) == len(matrix_params) + len(block_scalar_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params) + len(l3_scalar_params) + len(mod_router_params)
+        hc_params = list(self.hc_layers.parameters()) if self.hc_layers is not None else []
+        if self.hc_l3_layers is not None:
+            hc_params += list(self.hc_l3_layers.parameters())
+        assert len(list(self.parameters())) == len(matrix_params) + len(block_scalar_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(l3_embed_params) + len(l3_matrix_params) + len(l3_scalar_params) + len(mod_router_params) + len(hc_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -604,6 +705,9 @@ class GPT(nn.Module):
         # MoD router params: small learned projections, use AdamW like other scalar/gating params
         if mod_router_params:
             param_groups.append(dict(kind='adamw', params=mod_router_params, lr=scalar_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+        # mHC params: per-layer pre/post/res mixing weights (no weight decay, normal scalar LR)
+        if hc_params:
+            param_groups.append(dict(kind='adamw', params=hc_params, lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # L3 scalar params (like x0_lambdas: learned gating)
         if l3_scalar_params:
             param_groups.append(dict(kind='adamw', params=l3_scalar_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
@@ -642,6 +746,16 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+
+        # mHC: initialize parallel residual streams (all start as x)
+        hc = self.hc_layers is not None
+        if hc:
+            n_s = self.config.hc_n_streams
+            # Stream 0 = x (primary), streams 1+ = 0 (auxiliary, filled by H_post distribution)
+            streams = x.new_zeros(x.size(0), x.size(1), n_s, x.size(2))
+            streams[:, :, 0, :] = x
+            hc_H_res = self._hc_H_res  # pre-computed outside torch.compile by precompute_hc()
+
         if self.config.n_loops > 1:
             # Looped forward pass: shared blocks executed n_loops times
             # TBPTL: first tbptl loops run under no_grad (no autograd graph, saves memory)
@@ -652,33 +766,81 @@ class GPT(nn.Module):
                     for loop in range(tbptl):
                         l3_key = str(loop)
                         if loop > 0 and l3_key in self.l3_layers:
+                            if hc and self.hc_l3_layers is not None:
+                                x = self.hc_l3_layers[l3_key].aggregate(streams)
+                            l3_input = x
                             x = x + self._l3_scale(loop) * self.l3_layers[l3_key](x, idx)
+                            if hc and self.hc_l3_layers is not None:
+                                streams = self.hc_l3_layers[l3_key](streams, x - l3_input, self._hc_l3_H_res[l3_key])
+                                x = streams[:, :, 0, :]
+                            elif hc:
+                                streams = torch.cat([x.unsqueeze(2), streams[:, :, 1:, :]], dim=2)
                         if kv_cache is not None:
                             kv_cache.layer_offset = loop * n_layer
                         for i, block in enumerate(self.transformer.h):
+                            if hc:
+                                x = self.hc_layers[i].aggregate(streams)
                             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-                            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mod_budget=_mod_budget)
+                            block_input = x
+                            block_out = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mod_budget=_mod_budget)
+                            if hc:
+                                streams = self.hc_layers[i](streams, block_out - block_input, hc_H_res[i])
+                                x = streams[:, :, 0, :]
+                            else:
+                                x = block_out
             # Trainable loops (tbptl onward): full gradient tracking
             for loop in range(tbptl, self.config.n_loops):
                 l3_key = str(loop)
                 if loop > 0 and l3_key in self.l3_layers:
+                    if hc and self.hc_l3_layers is not None:
+                        x = self.hc_l3_layers[l3_key].aggregate(streams)
+                    l3_input = x
                     x = x + self._l3_scale(loop) * self.l3_layers[l3_key](x, idx)
+                    if hc and self.hc_l3_layers is not None:
+                        streams = self.hc_l3_layers[l3_key](streams, x - l3_input, self._hc_l3_H_res[l3_key])
+                        x = streams[:, :, 0, :]
+                    elif hc:
+                        streams = torch.cat([x.unsqueeze(2), streams[:, :, 1:, :]], dim=2)
                 if kv_cache is not None:
                     kv_cache.layer_offset = loop * n_layer
                 for i, block in enumerate(self.transformer.h):
+                    if hc:
+                        x = self.hc_layers[i].aggregate(streams)
                     x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                     ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-                    x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mod_budget=_mod_budget)
+                    block_input = x
+                    block_out = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mod_budget=_mod_budget)
+                    if hc:
+                        streams = self.hc_layers[i](streams, block_out - block_input, hc_H_res[i])
+                        x = streams[:, :, 0, :]
+                    else:
+                        x = block_out
         else:
             # Standard (non-looped) forward pass
             for i, block in enumerate(self.transformer.h):
+                if hc:
+                    x = self.hc_layers[i].aggregate(streams)
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
                 ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mod_budget=_mod_budget)
+                block_input = x
+                block_out = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mod_budget=_mod_budget)
+                if hc:
+                    streams = self.hc_layers[i](streams, block_out - block_input, hc_H_res[i])
+                    x = streams[:, :, 0, :]
+                else:
+                    x = block_out
                 # L3 layer after this block (if configured)
                 if str(i) in self.l3_layers:
+                    if hc and self.hc_l3_layers is not None:
+                        x = self.hc_l3_layers[str(i)].aggregate(streams)
+                    l3_input = x
                     x = x + self._l3_scale(i) * self.l3_layers[str(i)](x, idx)
+                    if hc and self.hc_l3_layers is not None:
+                        streams = self.hc_l3_layers[str(i)](streams, x - l3_input, self._hc_l3_H_res[str(i)])
+                        x = streams[:, :, 0, :]
+                    elif hc:
+                        streams = torch.cat([x.unsqueeze(2), streams[:, :, 1:, :]], dim=2)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -788,6 +950,41 @@ class GPT(nn.Module):
                     x = x + self._l3_scale(i) * self.l3_layers[str(i)](x, idx)
         return metrics
 
+    @torch.no_grad()
+    def precompute_hc(self):
+        """Pre-compute Sinkhorn H_res matrices outside torch.compile to avoid graph breaks."""
+        if self.hc_layers is None:
+            return
+        self._hc_H_res = [sinkhorn_log(hc.res_logits) for hc in self.hc_layers]
+        if self.hc_l3_layers is not None:
+            self._hc_l3_H_res = {k: sinkhorn_log(hc.res_logits) for k, hc in self.hc_l3_layers.items()}
+
+    def hc_diagnostics(self, idx=None):
+        """Compute mHC diagnostic metrics. Returns flat dict with hc/ prefix keys."""
+        if self.hc_layers is None:
+            return {}
+        metrics = {}
+        for i, hc in enumerate(self.hc_layers):
+            # H_res: how much cross-stream mixing (doubly stochastic via Sinkhorn)
+            M = sinkhorn_log(hc.res_logits)
+            diag_mass = M.diag().sum().item()
+            off_diag_mass = M.sum().item() - diag_mass
+            metrics[f"hc/res_offdiag_layer{i}"] = off_diag_mass
+            # H_pre: weight on stream 0 (how much the block input comes from primary stream)
+            pre_w = F.softmax(hc.pre_logits, dim=0)
+            metrics[f"hc/pre_stream0_layer{i}"] = pre_w[0].item()
+            # H_post: how block output is distributed
+            post_w = F.softmax(hc.post_logits, dim=0)
+            metrics[f"hc/post_stream0_layer{i}"] = post_w[0].item()
+        if self.hc_l3_layers is not None:
+            for k, hc in self.hc_l3_layers.items():
+                M = sinkhorn_log(hc.res_logits)
+                diag_mass = M.diag().sum().item()
+                metrics[f"hc/res_offdiag_l3_{k}"] = M.sum().item() - diag_mass
+                metrics[f"hc/pre_stream0_l3_{k}"] = F.softmax(hc.pre_logits, dim=0)[0].item()
+                metrics[f"hc/post_stream0_l3_{k}"] = F.softmax(hc.post_logits, dim=0)[0].item()
+        return metrics
+
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
         """
@@ -797,6 +994,7 @@ class GPT(nn.Module):
         - ids and the yielded tokens are simple Python lists and ints
         """
         assert isinstance(tokens, list)
+        self.precompute_hc()
         device = self.get_device()
         rng = None
         if temperature > 0:
